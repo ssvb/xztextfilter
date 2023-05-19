@@ -15,28 +15,47 @@ It's difficult to test everything, but some languages are more interesting than 
 ### Ukrainian
 
 Cyrillic alphabet, letters "ґ" and "Ґ" don't fit into the U+0400..U+047F range.
+
 https://dumps.wikimedia.org/ukwiki/20230501/ukwiki-20230501-pages-articles-multistream.xml.bz2
 
 ### Armenian
 
 Armenian occuipes a weird range U+0530..U+058F, which is not 128 characters aligned: https://en.wikipedia.org/wiki/Armenian_(Unicode_block)
+
 https://dumps.wikimedia.org/hywiki/20230501/hywiki-20230501-pages-articles-multistream.xml.bz2
 
 ### Vietnamese
 
 Vietnamese writing requires 134 additional letters (between both cases) besides the 52 already present in ASCII: https://en.wikipedia.org/wiki/Vietnamese_language_and_computers 
-https://dumps.wikimedia.org/viwiki/20230501/viwiki-20230501-pages-articles-multistream.xml.bz2 => viwiki-truncated-100k.xml.xz
+
+https://vietunicode.sourceforge.net/charset/vietalphabet.html
+
+https://dumps.wikimedia.org/viwiki/20230501/viwiki-20230501-pages-articles-multistream.xml.bz2
 
 ### Marathi
 
 3 bytes per character
+
 https://dumps.wikimedia.org/mrwiki/20230501/mrwiki-20230501-pages-articles-multistream.xml.bz2
 
 ## Wiktionary dictionaries in binary StarDict format
 
 https://en.wiktionary.org/wiki/Wiktionary:Copyrights
+
 Downloaded the .syn and .idx files of the Russian-English dictionary from https://github.com/Vuizur/Wiktionary-Dictionaries
 
 ## Tatoeba
 
-TBD
+Download the CC0 licensed sentences from https://downloads.tatoeba.org/exports/sentences_CC0.tar.bz2
+
+```Ruby
+```
+
+```
+$ sqlite3 tatoeba-nonascii-CC0.sqlite3
+CREATE TABLE sentences(id INTEGER PRIMARY KEY, lng TEXT, txt TEXT);
+.mode csv
+.mode ascii
+.separator "\t" "\n"
+.import tatoeba-nonascii-CC0.csv sentences
+```
