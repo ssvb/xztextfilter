@@ -1,4 +1,4 @@
-# read UTF-8 text from stdout and analyze its properties
+# read an UTF-8 text from stdout and analyze its properties
 
 freqblk = {}
 freqch = {}

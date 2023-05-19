@@ -1,3 +1,6 @@
+# Remove "unintresting" sentences with fewer than 10% nonascii
+# characters and also remove timestamps
+
 def interesting(str)
   total = 0
   ascii = 0
