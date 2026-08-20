@@ -31,22 +31,23 @@
  *    - 0.0 = Favorable (Good compression synergy)
  *    - 1.0 = Unfavorable (Poor compression synergy)
  * 
- * 4. Weighted Displacement Selection
+ * 4. Stochastic Weighted Displacement Selection (8-Neighbor Subsampling)
  *    On each iteration, every element in the table is evaluated. Its "displacement 
- *    desirability" weight is calculated by summing the badness factors of all 
- *    other elements currently sharing its chunk. The algorithm uses roulette-wheel 
- *    selection to pick two elements from *different* chunks based on these weights, 
- *    ensuring that discordant elements are highly likely to be swapped out.
+ *    desirability" weight is calculated by summing the badness factors of 8 
+ *    RANDOMLY CHOSEN elements currently sharing its chunk. The algorithm uses 
+ *    roulette-wheel selection to pick two elements from *different* chunks based 
+ *    on these weights. Subsampling introduces stochastic noise which prevents 
+ *    stagnation in local minima.
  * 
- * 5. Greedy Acceptance & Balanced EWMA Feedback Loop
- *    The selected pair is swapped, the table is normalized to the invariant, and 
- *    the new compression size is evaluated. A balanced push-pull feedback loop is applied:
+ * 5. Greedy Acceptance & Balanced EWMA Feedback Loop (8-Neighbor Subsampling)
+ *    The selected pair is swapped, normalized, and evaluated. A balanced push-pull 
+ *    feedback loop updates exactly 8 RANDOMLY CHOSEN neighbors for each swapped element:
  *      - IF IMPROVES (Favorable Swap): 
- *          * NEW neighbors -> Favorable (0.0): Moving to them was a good idea.
- *          * OLD neighbors -> Unfavorable (1.0): Moving away from them was a good idea.
+ *          * 8 NEW neighbors -> Favorable (0.0): Moving to them was a good idea.
+ *          * 8 OLD neighbors -> Unfavorable (1.0): Moving away from them was a good idea.
  *      - IF DEGRADES (Unfavorable Swap): 
- *          * NEW neighbors -> Unfavorable (1.0): Moving to them was a bad idea.
- *          * OLD neighbors -> Favorable (0.0): Staying with them was better.
+ *          * 8 NEW neighbors -> Unfavorable (1.0): Moving to them was a bad idea.
+ *          * 8 OLD neighbors -> Favorable (0.0): Staying with them was better.
  * ==============================================================================
  */
 
@@ -100,6 +101,32 @@ void print_help(const char *prog_name) {
     printf("\n");
     printf("Description:\n");
     printf("  Optimizes byte mappings using EWMA Tabu-like Search with strict Chunk Normalization.\n");
+}
+
+// -------------------------------------------------------------------------
+// Helper: Select distinct random neighbor indices from within a chunk
+// -------------------------------------------------------------------------
+void get_random_neighbors(int chunk_size, int elem_idx_in_chunk, int num_picks, int *picks) {
+    int count = 0;
+    while (count < num_picks) {
+        int cand = rand() % chunk_size;
+        
+        // Cannot pick itself
+        if (cand == elem_idx_in_chunk) continue;
+        
+        // Ensure distinct choices
+        int duplicate = 0;
+        for (int k = 0; k < count; k++) {
+            if (picks[k] == cand) {
+                duplicate = 1;
+                break;
+            }
+        }
+        
+        if (!duplicate) {
+            picks[count++] = cand;
+        }
+    }
 }
 
 // Function to enforce the structural invariant on the remap table
@@ -275,6 +302,9 @@ int main(int argc, char **argv) {
 
     int num_chunks = 1 << lc_param;
     int chunk_size = 256 / num_chunks;
+    
+    // Safety bound: Request 8 neighbors, unless the chunk is extremely small
+    int num_picks = (chunk_size - 1 < 8) ? (chunk_size - 1) : 8;
 
     FileData *files = malloc(file_count * sizeof(FileData));
     size_t max_file_size = 0;
@@ -368,7 +398,7 @@ int main(int argc, char **argv) {
 
         iterations++;
 
-        // 3. Evaluate Displacement Desirability Weights
+        // 3. Evaluate Displacement Desirability Weights (Using 8 Random Neighbors)
         double weights[256];
         double total_weight = 0.0;
         
@@ -378,12 +408,15 @@ int main(int argc, char **argv) {
             double badness_sum = 0.0;
             uint8_t elem = current_remap[i];
             
-            for (int j = 0; j < chunk_size; j++) {
-                if (start + j != i) {
-                    uint8_t neighbor = current_remap[start + j];
-                    badness_sum += ewma_badness[elem][neighbor];
-                }
+            // Randomly select 8 distinct neighbors from the same chunk
+            int picks[8];
+            get_random_neighbors(chunk_size, i - start, num_picks, picks);
+            
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t neighbor = current_remap[start + picks[k]];
+                badness_sum += ewma_badness[elem][neighbor];
             }
+
             // Add a small epsilon to ensure even 'perfect' chunks have a tiny chance to mutate
             weights[i] = badness_sum + 0.01; 
             total_weight += weights[i];
@@ -465,40 +498,39 @@ int main(int argc, char **argv) {
         int new_start1 = new_c1 * chunk_size;
         int new_start2 = new_c2 * chunk_size;
 
+        // Select exactly 8 (or chunk size - 1) distinct random neighbors for EWMA updating
+        int old_picks1[8], old_picks2[8], new_picks1[8], new_picks2[8];
+        get_random_neighbors(chunk_size, idx1 - old_start1, num_picks, old_picks1);
+        get_random_neighbors(chunk_size, idx2 - old_start2, num_picks, old_picks2);
+        get_random_neighbors(chunk_size, new_idx1 - new_start1, num_picks, new_picks1);
+        get_random_neighbors(chunk_size, new_idx2 - new_start2, num_picks, new_picks2);
+
         // 9. Acceptance Criterion & Balanced Push-Pull EWMA Weight Updating
         if (new_sum < current_sum) {
             // ACCEPT: The swap improves (or maintains) compressibility
             
             // 1. OLD neighbors push towards Unfavorable (1.0) -> because leaving them helped
-            for (int i = 0; i < chunk_size; i++) {
-                uint8_t old_neighbor = current_remap[old_start1 + i];
-                if (old_neighbor != e1) {
-                    ewma_badness[e1][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][old_neighbor] + EWMA_ALPHA * 1.0;
-                    ewma_badness[old_neighbor][e1] = ewma_badness[e1][old_neighbor]; // Symmetric
-                }
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t old_neighbor = current_remap[old_start1 + old_picks1[k]];
+                ewma_badness[e1][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][old_neighbor] + EWMA_ALPHA * 1.0;
+                ewma_badness[old_neighbor][e1] = ewma_badness[e1][old_neighbor]; // Symmetric
             }
-            for (int i = 0; i < chunk_size; i++) {
-                uint8_t old_neighbor = current_remap[old_start2 + i];
-                if (old_neighbor != e2) {
-                    ewma_badness[e2][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][old_neighbor] + EWMA_ALPHA * 1.0;
-                    ewma_badness[old_neighbor][e2] = ewma_badness[e2][old_neighbor];
-                }
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t old_neighbor = current_remap[old_start2 + old_picks2[k]];
+                ewma_badness[e2][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][old_neighbor] + EWMA_ALPHA * 1.0;
+                ewma_badness[old_neighbor][e2] = ewma_badness[e2][old_neighbor];
             }
 
             // 2. NEW neighbors push towards Favorable (0.0) -> because joining them helped
-            for (int i = 0; i < chunk_size; i++) {
-                uint8_t new_neighbor = proposed_remap[new_start1 + i];
-                if (new_neighbor != e1) {
-                    ewma_badness[e1][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][new_neighbor] + EWMA_ALPHA * 0.0;
-                    ewma_badness[new_neighbor][e1] = ewma_badness[e1][new_neighbor]; 
-                }
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t new_neighbor = proposed_remap[new_start1 + new_picks1[k]];
+                ewma_badness[e1][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][new_neighbor] + EWMA_ALPHA * 0.0;
+                ewma_badness[new_neighbor][e1] = ewma_badness[e1][new_neighbor]; 
             }
-            for (int i = 0; i < chunk_size; i++) {
-                uint8_t new_neighbor = proposed_remap[new_start2 + i];
-                if (new_neighbor != e2) {
-                    ewma_badness[e2][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][new_neighbor] + EWMA_ALPHA * 0.0;
-                    ewma_badness[new_neighbor][e2] = ewma_badness[e2][new_neighbor];
-                }
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t new_neighbor = proposed_remap[new_start2 + new_picks2[k]];
+                ewma_badness[e2][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][new_neighbor] + EWMA_ALPHA * 0.0;
+                ewma_badness[new_neighbor][e2] = ewma_badness[e2][new_neighbor];
             }
 
             // Apply the proposed mapping to the current state
@@ -562,35 +594,27 @@ int main(int argc, char **argv) {
             // REJECT: Compressibility degraded, do not merge proposed_remap
             
             // 1. NEW (attempted) neighbors push towards Unfavorable (1.0) -> because joining them hurt
-            for (int i = 0; i < chunk_size; i++) {
-                uint8_t new_neighbor = proposed_remap[new_start1 + i];
-                if (new_neighbor != e1) {
-                    ewma_badness[e1][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][new_neighbor] + EWMA_ALPHA * 1.0;
-                    ewma_badness[new_neighbor][e1] = ewma_badness[e1][new_neighbor];
-                }
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t new_neighbor = proposed_remap[new_start1 + new_picks1[k]];
+                ewma_badness[e1][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][new_neighbor] + EWMA_ALPHA * 1.0;
+                ewma_badness[new_neighbor][e1] = ewma_badness[e1][new_neighbor];
             }
-            for (int i = 0; i < chunk_size; i++) {
-                uint8_t new_neighbor = proposed_remap[new_start2 + i];
-                if (new_neighbor != e2) {
-                    ewma_badness[e2][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][new_neighbor] + EWMA_ALPHA * 1.0;
-                    ewma_badness[new_neighbor][e2] = ewma_badness[e2][new_neighbor];
-                }
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t new_neighbor = proposed_remap[new_start2 + new_picks2[k]];
+                ewma_badness[e2][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][new_neighbor] + EWMA_ALPHA * 1.0;
+                ewma_badness[new_neighbor][e2] = ewma_badness[e2][new_neighbor];
             }
 
             // 2. OLD (existing) neighbors push towards Favorable (0.0) -> because staying with them was better
-            for (int i = 0; i < chunk_size; i++) {
-                uint8_t old_neighbor = current_remap[old_start1 + i];
-                if (old_neighbor != e1) {
-                    ewma_badness[e1][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][old_neighbor] + EWMA_ALPHA * 0.0;
-                    ewma_badness[old_neighbor][e1] = ewma_badness[e1][old_neighbor];
-                }
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t old_neighbor = current_remap[old_start1 + old_picks1[k]];
+                ewma_badness[e1][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][old_neighbor] + EWMA_ALPHA * 0.0;
+                ewma_badness[old_neighbor][e1] = ewma_badness[e1][old_neighbor];
             }
-            for (int i = 0; i < chunk_size; i++) {
-                uint8_t old_neighbor = current_remap[old_start2 + i];
-                if (old_neighbor != e2) {
-                    ewma_badness[e2][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][old_neighbor] + EWMA_ALPHA * 0.0;
-                    ewma_badness[old_neighbor][e2] = ewma_badness[e2][old_neighbor];
-                }
+            for (int k = 0; k < num_picks; k++) {
+                uint8_t old_neighbor = current_remap[old_start2 + old_picks2[k]];
+                ewma_badness[e2][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][old_neighbor] + EWMA_ALPHA * 0.0;
+                ewma_badness[old_neighbor][e2] = ewma_badness[e2][old_neighbor];
             }
         }
     }
