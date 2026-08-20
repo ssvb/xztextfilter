@@ -8,34 +8,39 @@
 
 /**
  * ==============================================================================
- * ALGORITHM OVERVIEW: Multi-Target Simulated Annealing
+ * ALGORITHM OVERVIEW: Multi-Target Simulated Annealing with Defragmentation
  * ==============================================================================
  * 
  * 1. The Global Objective (Multi-File Optimization)
- *    Instead of minimizing the compressed size of a single file, the objective 
- *    function now calculates the SUM of the compressed sizes of all input files.
- *    This forces the algorithm to find a single, universal byte permutation that 
- *    generalizes well across the entire dataset.
+ *    The objective function calculates the SUM of the compressed sizes of all 
+ *    input files. This guides the search toward a universal byte permutation 
+ *    that minimizes entropy across the entire dataset.
  * 
- * 2. Competing Entropy (Local Regression for Global Gain)
- *    Because the files may have vastly different underlying byte distributions, 
- *    a swap that heavily optimizes File A might slightly de-optimize File B.
- *    By summing the sizes, the algorithm naturally performs tradeoffs, sacrificing 
- *    compression on one file if it yields a mathematically larger overall saving.
+ * 2. Position-Independent LZMA Model Tuning
+ *    - lc (Literal Context) = 1
+ *    - lp (Literal Position) = 0
+ *    - pb (Match Position) = 0
+ *    Zeroing position bits ensures compression relies solely on byte sequence 
+ *    structure, preventing alignment artifacts from skewing the evaluation.
  * 
- * 3. LZMA Model Tuning (lc=1, lp=0, pb=0)
- *    - lc (Literal Context): 1
- *    - lp (Literal Position): 0
- *    - pb (Match Position): 0
- *    Position-independent compression ensures the permutation is evaluated purely 
- *    on sequence structure, preventing alignment artifacts from skewing results.
+ * 3. Competing Entropy & Probabilistic Acceptance
+ *    - Global improvements are accepted unconditionally.
+ *    - Global regressions are accepted probabilistically: P = exp(-dE / T). 
+ *    This allows the algorithm to escape local minima. The temperature T cools 
+ *    linearly over the timeout period.
  * 
- * 4. Thermodynamic Acceptance (Simulated Annealing)
- *    Energy (E) = Sum of all compressed bitstreams.
- *    Delta (dE) = New Energy - Current Energy.
- *    We accept all improving mutations (dE < 0). For regressions (dE > 0), 
- *    we accept them probabilistically based on P = exp(-dE / T). The temperature
- *    T cools linearly from INITIAL_TEMPERATURE down to 0 over the timeout period.
+ * 4. Dual Mutation Strategy (Random Swap vs. Defragmentation)
+ *    - Random Swap (75%): Swaps two entirely random indices in the mapping.
+ *    - Defragmentation (25%): Picks an index 'i', targets the value one higher 
+ *      than remap[i], finds where that target value is currently located ('j'), 
+ *      and swaps remap[i+1] with remap[j]. This encourages creating contiguous, 
+ *      ascending byte sequences, which greatly benefits LZMA's Markov chain 
+ *      modeling when evaluating serialized data streams.
+ * 
+ * 5. Absolute Baseline Tracking
+ *    The algorithm evaluates a pure identity mapping first. This establishes a 
+ *    fixed anchor point to accurately report absolute and percentage-based 
+ *    compression gains, regardless of the initial seed.
  * ==============================================================================
  */
 
@@ -43,17 +48,18 @@
 
 /* 
  * REPLACE THIS BLOCK with the output from stderr to use the best mapping 
- * as the new seed for the next run. Initialized here to the Identity Mapping.
+ * as the new seed for the next run. Initialized here to the Identity Mapping
+ * using spaced character literals for perfect column alignment.
  */
 unsigned char seed_remap[256] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
-    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
-    0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f,
-    0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f,
-    0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f,
+    ' ' , '!' , '"' , '#' , '$' , '%' , '&' , '\'', '(' , ')' , '*' , '+' , ',' , '-' , '.' , '/' ,
+    '0' , '1' , '2' , '3' , '4' , '5' , '6' , '7' , '8' , '9' , ':' , ';' , '<' , '=' , '>' , '?' ,
+    '@' , 'A' , 'B' , 'C' , 'D' , 'E' , 'F' , 'G' , 'H' , 'I' , 'J' , 'K' , 'L' , 'M' , 'N' , 'O' ,
+    'P' , 'Q' , 'R' , 'S' , 'T' , 'U' , 'V' , 'W' , 'X' , 'Y' , 'Z' , '[' , '\\', ']' , '^' , '_' ,
+    '`' , 'a' , 'b' , 'c' , 'd' , 'e' , 'f' , 'g' , 'h' , 'i' , 'j' , 'k' , 'l' , 'm' , 'n' , 'o' ,
+    'p' , 'q' , 'r' , 's' , 't' , 'u' , 'v' , 'w' , 'x' , 'y' , 'z' , '{' , '|' , '}' , '~' , 0x7f,
     0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
     0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
     0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
@@ -68,9 +74,9 @@ typedef struct {
     const char *filename;
     uint8_t *in_buf;
     size_t file_size;
-    size_t current_comp_size; // The size under the current working table
-    size_t temp_comp_size;    // The size during a candidate mutation
-    size_t best_comp_size;    // The size recorded during the last global best
+    size_t baseline_comp_size; 
+    size_t current_comp_size;  
+    size_t temp_comp_size;     
 } FileData;
 
 // Function to evaluate the objective (compress buffer with tuned LZMA properties)
@@ -100,11 +106,29 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
     return (ret == LZMA_OK) ? out_pos : out_capacity + 1;
 }
 
-// Dumps the current best mapping exactly as a C array
+// Helper function to print bytes with space padding for alignment
+void print_byte_literal(FILE *out, uint8_t b) {
+    if (b >= 32 && b <= 126) {
+        if (b == '\'') {
+            fprintf(out, "'\\''"); // 4 characters wide natively
+        } else if (b == '\\') {
+            fprintf(out, "'\\\\'"); // 4 characters wide natively
+        } else {
+            fprintf(out, "'%c' ", b); // Pad with a space to make it 4 chars wide
+        }
+    } else {
+        fprintf(out, "0x%02x", b); // 4 characters wide natively
+    }
+}
+
+// Dumps the current best mapping exactly as a perfectly aligned C array
 void print_remap_table_as_source(const uint8_t *remap) {
     fprintf(stderr, "unsigned char seed_remap[256] = {\n    ");
     for (int i = 0; i < 256; i++) {
-        fprintf(stderr, "0x%02x%s", remap[i], (i < 255) ? ", " : "");
+        print_byte_literal(stderr, remap[i]);
+        if (i < 255) {
+            fprintf(stderr, ", ");
+        }
         if ((i + 1) % 16 == 0 && i < 255) {
             fprintf(stderr, "\n    ");
         }
@@ -114,9 +138,8 @@ void print_remap_table_as_source(const uint8_t *remap) {
 }
 
 int main(int argc, char **argv) {
-    int timeout = 600; // Default timeout: 10 minutes (600 seconds)
+    int timeout = 600; 
     
-    // Allocate space to store pointers to the provided filenames
     const char **filenames = malloc(argc * sizeof(char*));
     int file_count = 0;
 
@@ -138,7 +161,6 @@ int main(int argc, char **argv) {
     FileData *files = malloc(file_count * sizeof(FileData));
     size_t max_file_size = 0;
 
-    // Load all files into memory
     for (int i = 0; i < file_count; i++) {
         files[i].filename = filenames[i];
         FILE *f = fopen(filenames[i], "rb");
@@ -163,29 +185,39 @@ int main(int argc, char **argv) {
         fclose(f);
     }
 
-    // Shared working buffers dimensioned to the largest file in the batch
     uint8_t *remapped_buf = malloc(max_file_size);
     size_t out_capacity = lzma_stream_buffer_bound(max_file_size);
     uint8_t *out_buf = malloc(out_capacity);
 
+    // 1. Evaluate True Baseline (Identity Mapping)
+    size_t baseline_sum = 0;
+    for (int i = 0; i < file_count; i++) {
+        for (size_t j = 0; j < files[i].file_size; j++) {
+            remapped_buf[j] = files[i].in_buf[j];
+        }
+        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity);
+        files[i].baseline_comp_size = s;
+        baseline_sum += s;
+    }
+    
+    fprintf(stderr, "Original Identity Mapping Total Size: %zu bytes\n\n", baseline_sum);
+
+    // 2. Evaluate User Seed
     uint8_t current_remap[256];
     memcpy(current_remap, seed_remap, 256);
 
-    // Initial evaluation phase: Calculate baseline energy (sum of all file sizes)
     size_t current_sum = 0;
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
             remapped_buf[j] = current_remap[files[i].in_buf[j]];
         }
         size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity);
-        
         files[i].current_comp_size = s;
-        files[i].best_comp_size = s;
         current_sum += s;
     }
     
     size_t best_sum = current_sum;
-    fprintf(stderr, "Starting seed total size: %zu bytes\n\n", best_sum);
+    fprintf(stderr, "Starting Seed Total Size: %zu bytes\n\n", best_sum);
 
     srand((unsigned int)time(NULL));
     time_t start_time = time(NULL);
@@ -204,16 +236,40 @@ int main(int argc, char **argv) {
         double temperature = INITIAL_TEMPERATURE * (1.0 - progress);
         if (temperature < 0.001) temperature = 0.001; 
 
-        // 1. Mutation Phase (Create a neighbor state)
-        int idx1 = rand() % 256;
-        int idx2 = rand() % 256;
-        if (idx1 == idx2) continue;
+        // 3. Mutation Phase (Choose between Random or Defragment)
+        int is_defrag = (rand() % 4 == 0); // 25% chance of defragmenting
+        int idx1, idx2;
+        const char *op_type;
 
+        if (is_defrag) {
+            int i = rand() % 255; // 0 to 254 inclusive
+            if (current_remap[i] == 0xFF) continue; // Skip if we cannot increment
+            
+            uint8_t target_val = current_remap[i] + 1;
+            int j = 0;
+            // Find where the target value is currently mapped
+            for (; j < 256; j++) {
+                if (current_remap[j] == target_val) break;
+            }
+            
+            idx1 = i + 1;
+            idx2 = j;
+            op_type = "defragment";
+            
+            if (idx1 == idx2) continue; // Already defragmented here; don't waste evaluation
+        } else {
+            idx1 = rand() % 256;
+            idx2 = rand() % 256;
+            if (idx1 == idx2) continue;
+            op_type = "random";
+        }
+
+        // Apply Swap
         uint8_t temp = current_remap[idx1];
         current_remap[idx1] = current_remap[idx2];
         current_remap[idx2] = temp;
 
-        // 2. Evaluation Phase (Evaluate all files under new mapping)
+        // 4. Evaluation Phase
         size_t new_sum = 0;
         for (int i = 0; i < file_count; i++) {
             for (size_t j = 0; j < files[i].file_size; j++) {
@@ -223,7 +279,7 @@ int main(int argc, char **argv) {
             new_sum += files[i].temp_comp_size;
         }
 
-        // 3. Metropolis Acceptance Criterion
+        // 5. Metropolis Acceptance Criterion
         int accept = 0;
         if (new_sum < current_sum) {
             accept = 1; 
@@ -237,7 +293,6 @@ int main(int argc, char **argv) {
         }
 
         if (accept) {
-            // Apply temp state to current state
             current_sum = new_sum;
             for (int i = 0; i < file_count; i++) {
                 files[i].current_comp_size = files[i].temp_comp_size;
@@ -247,24 +302,28 @@ int main(int argc, char **argv) {
             if (current_sum < best_sum) {
                 best_sum = current_sum;
                 
-                fprintf(stderr, "/* NEW GLOBAL BEST: %zu bytes (Iter %llu, Temp %.2f) */\n", 
-                        best_sum, iterations, temperature);
+                long long total_delta = (long long)best_sum - (long long)baseline_sum;
+                double total_pct = ((double)total_delta / (double)baseline_sum) * 100.0;
+
+                fprintf(stderr, "/* NEW GLOBAL BEST: %zu bytes (Iter %llu, Temp %.2f, Op: %s) */\n", 
+                        best_sum, iterations, temperature, op_type);
+                fprintf(stderr, "/* TOTAL DELTA vs IDENTITY: %lld bytes (%.2f%%) */\n", total_delta, total_pct);
                 
-                // Report per-file metrics tracking regressions and improvements
-                fprintf(stderr, "/* FILE DELTAS:\n");
+                fprintf(stderr, "/* FILE METRICS vs IDENTITY:\n");
                 for (int i = 0; i < file_count; i++) {
-                    long long delta = (long long)files[i].current_comp_size - (long long)files[i].best_comp_size;
+                    long long delta = (long long)files[i].current_comp_size - (long long)files[i].baseline_comp_size;
+                    double pct = ((double)delta / (double)files[i].baseline_comp_size) * 100.0;
                     
                     if (delta < 0) {
-                        fprintf(stderr, "   [IMPROVED]  %s: %zu bytes (%lld bytes)\n", files[i].filename, files[i].current_comp_size, delta);
+                        fprintf(stderr, "   [IMPROVED]  %s: %zu bytes (%lld bytes, %.2f%%)\n", 
+                                files[i].filename, files[i].current_comp_size, delta, pct);
                     } else if (delta > 0) {
-                        fprintf(stderr, "   [REGRESSED] %s: %zu bytes (+%lld bytes)\n", files[i].filename, files[i].current_comp_size, delta);
+                        fprintf(stderr, "   [REGRESSED] %s: %zu bytes (+%lld bytes, +%.2f%%)\n", 
+                                files[i].filename, files[i].current_comp_size, delta, pct);
                     } else {
-                        fprintf(stderr, "   [UNCHANGED] %s: %zu bytes\n", files[i].filename, files[i].current_comp_size);
+                        fprintf(stderr, "   [UNCHANGED] %s: %zu bytes (0 bytes, 0.00%%)\n", 
+                                files[i].filename, files[i].current_comp_size);
                     }
-                    
-                    // Sync the best known size for this file
-                    files[i].best_comp_size = files[i].current_comp_size;
                 }
                 fprintf(stderr, "*/\n");
                 
