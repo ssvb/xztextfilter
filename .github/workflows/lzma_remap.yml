@@ -2,7 +2,7 @@ name: LZMA Stochastic Optimization
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "remapfilter" ]
   workflow_dispatch: # Allows manual triggering from the UI
 
 jobs:
