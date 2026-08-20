@@ -2,7 +2,7 @@ name: LZMA Stochastic Optimization
 
 on:
   push:
-    branches: [ "main", "remapfilter", "remapfilter4", "remapfilter_lc1", "remapfilter_lc4", "remapfilter_default" ]
+    branches: [ "main", "remapfilter", "remapfilter4", "remapfilter_lc1", "remapfilter_lc4", "remapfilter_default", "remapfilter_lc0" ]
   workflow_dispatch: # Allows manual triggering from the UI
 
 jobs:
@@ -27,4 +27,4 @@ jobs:
           # The C program takes the timeout in seconds.
           # 5 hours = 18000 seconds. Setting to 17900 to ensure graceful C exit
           # before the GitHub Actions runner forcibly terminates the container.
-          ./lzma_remap_sa_multi --lc=3 --lp=0 --pb=2 --timout=17900 /usr/bin/sed /usr/include/math.h bash.mo pg2701.txt pg940.txt
+          ./lzma_remap_sa_multi --lc=0 --lp=0 --pb=0 --timout=17900 /usr/bin/sed /usr/include/math.h bash.mo pg2701.txt pg940.txt
