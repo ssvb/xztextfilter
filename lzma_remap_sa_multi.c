@@ -17,8 +17,10 @@
  *    that minimizes entropy across the entire dataset.
  * 
  * 2. Tunable LZMA Markov Chain Modeling
- *    - dict (Dictionary Size): Configurable via '--dict=' in KB (default: 8192).
- *      Sets the LZMA dictionary size.
+ *    - dict (Dictionary Size): Configurable via '--dict=' in KB (default: 4).
+ *      Defaults to the 4KB minimum to drastically increase evaluation speed and 
+ *      to force the objective function to rely heavily on the literal/entropy 
+ *      coding (Markov chains) rather than finding long historical LZ matches.
  *    - lc (Literal Context): Configurable via '--lc=' (default: 3). 
  *      Determines how many of the highest bits of the PREVIOUS byte are used as 
  *      the context to select the probability model for encoding the CURRENT byte. 
@@ -93,7 +95,7 @@ void print_help(const char *prog_name) {
     printf("Options:\n");
     printf("  --help          Show this help message and exit.\n");
     printf("  --timeout=SEC   Set timeout in seconds (default: 600).\n");
-    printf("  --dict=KB       Set LZMA dictionary size in kilobytes (default: 8192).\n");
+    printf("  --dict=KB       Set LZMA dictionary size in kilobytes (default: 4).\n");
     printf("  --lc=BITS       Set LZMA literal context bits (0-4, default: 3).\n");
     printf("  --lp=BITS       Set LZMA literal position bits (0-4, default: 0).\n");
     printf("  --pb=BITS       Set LZMA position bits (0-4, default: 2).\n");
@@ -111,7 +113,7 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
         exit(EXIT_FAILURE);
     }
     
-    // LZMA requires a minimum dictionary size of 4096 bytes.
+    // LZMA requires a minimum dictionary size of 4096 bytes (4 KB).
     uint32_t dict_bytes = (uint32_t)dict_param_kb * 1024;
     opt.dict_size = (dict_bytes < LZMA_DICT_SIZE_MIN) ? LZMA_DICT_SIZE_MIN : dict_bytes; 
     
@@ -166,7 +168,7 @@ void print_remap_table_as_source(const uint8_t *remap) {
 
 int main(int argc, char **argv) {
     int timeout = 600; 
-    int dict_param_kb = 8192;
+    int dict_param_kb = 4; // Updated default for increased speed & entropy coding priority
     int lc_param = 3; 
     int lp_param = 0;
     int pb_param = 2;
@@ -181,7 +183,7 @@ int main(int argc, char **argv) {
             return EXIT_SUCCESS;
         } else if (strncmp(argv[i], "--timeout=", 10) == 0) {
             timeout = atoi(argv[i] + 10);
-        } else if (strncmp(argv[i], "--timout=", 9) == 0) { // Catch common typo
+        } else if (strncmp(argv[i], "--timout=", 9) == 0) { 
             timeout = atoi(argv[i] + 9);
         } else if (strncmp(argv[i], "--dict=", 7) == 0) {
             dict_param_kb = atoi(argv[i] + 7);
@@ -392,7 +394,6 @@ int main(int argc, char **argv) {
                             max_filename_len, files[i].filename, delta, pct);
                 }
                 
-                // Show "Previous" step comparisons last as requested
                 fprintf(stderr, "   FILE METRICS [vs Previous]:\n");
                 for (int i = 0; i < file_count; i++) {
                     long long delta = (long long)files[i].temp_comp_size - (long long)files[i].milestone_comp_size;
