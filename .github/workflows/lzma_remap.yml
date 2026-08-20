@@ -20,7 +20,7 @@ jobs:
 
       - name: Compile Optimizer
         run: |
-          gcc -O3 -o lzma_remap_sa lzma_remap_sa.c -llzma -lm
+          gcc -O3 -o lzma_remap_sa_multi lzma_remap_sa_multi.c -llzma -lm
 
       - name: Run Simulated Annealing (5 Hours)
         run: |
