@@ -16,8 +16,12 @@
  *    input files. This guides the search toward a universal byte permutation 
  *    that minimizes entropy across the entire dataset.
  * 
- * 2. Position-Independent LZMA Model Tuning
- *    - lc (Literal Context) = 1
+ * 2. Tunable LZMA Markov Chain Modeling
+ *    - lc (Literal Context): Configurable via '--lc=' (default: 3). 
+ *      Determines how many of the highest bits of the PREVIOUS byte are used as 
+ *      the context to select the probability model for encoding the CURRENT byte. 
+ *      lc=3 means the top 3 bits (8 possible states) are used. Tuning this allows 
+ *      the optimization to target specific types of byte-to-byte correlation.
  *    - lp (Literal Position) = 0
  *    - pb (Match Position) = 0
  *    Zeroing position bits ensures compression relies solely on byte sequence 
@@ -37,10 +41,11 @@
  *      ascending byte sequences, which greatly benefits LZMA's Markov chain 
  *      modeling when evaluating serialized data streams.
  * 
- * 5. Absolute Baseline Tracking
- *    The algorithm evaluates a pure identity mapping first. This establishes a 
- *    fixed anchor point to accurately report absolute and percentage-based 
- *    compression gains, regardless of the initial seed.
+ * 5. State & Milestone Tracking
+ *    The algorithm maintains three distinct tracking states per file:
+ *    - Baseline: Size under pure identity mapping (fixed anchor).
+ *    - Current: Size under the currently accepted SA iteration (fluctuates).
+ *    - Milestone: Size at the last recorded global best (ratchets down).
  * ==============================================================================
  */
 
@@ -74,13 +79,26 @@ typedef struct {
     const char *filename;
     uint8_t *in_buf;
     size_t file_size;
-    size_t baseline_comp_size; 
-    size_t current_comp_size;  
-    size_t temp_comp_size;     
+    size_t baseline_comp_size;  // Pure identity baseline
+    size_t current_comp_size;   // Evaluated size of the current working SA state
+    size_t milestone_comp_size; // Evaluated size at the last global best
+    size_t temp_comp_size;      // Evaluated size during a candidate mutation
 } FileData;
 
+void print_help(const char *prog_name) {
+    printf("Usage: %s [OPTIONS] <input_file_1> [input_file_2 ...]\n\n", prog_name);
+    printf("Options:\n");
+    printf("  --help          Show this help message and exit.\n");
+    printf("  --timeout=SEC   Set timeout in seconds (default: 600).\n");
+    printf("  --lc=BITS       Set LZMA literal context bits (0-4, default: 3).\n");
+    printf("\n");
+    printf("Description:\n");
+    printf("  Optimizes byte mappings to minimize LZMA compressed size across provided files.\n");
+    printf("  Uses Simulated Annealing and continuously outputs the best mapping to stderr.\n");
+}
+
 // Function to evaluate the objective (compress buffer with tuned LZMA properties)
-size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity) {
+size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, int lc_param) {
     lzma_options_lzma opt;
     if (lzma_lzma_preset(&opt, 0)) {
         fprintf(stderr, "Error: Failed to set LZMA preset.\n");
@@ -88,7 +106,7 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
     }
     
     opt.dict_size = LZMA_DICT_SIZE_MIN; 
-    opt.lc = 1;                         
+    opt.lc = lc_param;                         
     opt.lp = 0;                         
     opt.pb = 0;                         
 
@@ -110,14 +128,14 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
 void print_byte_literal(FILE *out, uint8_t b) {
     if (b >= 32 && b <= 126) {
         if (b == '\'') {
-            fprintf(out, "'\\''"); // 4 characters wide natively
+            fprintf(out, "'\\''"); 
         } else if (b == '\\') {
-            fprintf(out, "'\\\\'"); // 4 characters wide natively
+            fprintf(out, "'\\\\'"); 
         } else {
-            fprintf(out, "'%c' ", b); // Pad with a space to make it 4 chars wide
+            fprintf(out, "'%c' ", b); 
         }
     } else {
-        fprintf(out, "0x%02x", b); // 4 characters wide natively
+        fprintf(out, "0x%02x", b); 
     }
 }
 
@@ -139,22 +157,34 @@ void print_remap_table_as_source(const uint8_t *remap) {
 
 int main(int argc, char **argv) {
     int timeout = 600; 
+    int lc_param = 3; 
     
     const char **filenames = malloc(argc * sizeof(char*));
     int file_count = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--timeout=", 10) == 0) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_help(argv[0]);
+            free(filenames);
+            return EXIT_SUCCESS;
+        } else if (strncmp(argv[i], "--timeout=", 10) == 0) {
             timeout = atoi(argv[i] + 10);
-        } else if (strncmp(argv[i], "--timout=", 9) == 0) {
+        } else if (strncmp(argv[i], "--timout=", 9) == 0) { // Keep alias for backwards compat
             timeout = atoi(argv[i] + 9);
+        } else if (strncmp(argv[i], "--lc=", 5) == 0) {
+            lc_param = atoi(argv[i] + 5);
+            if (lc_param < 0 || lc_param > 4) {
+                fprintf(stderr, "Warning: --lc=%d might be rejected by liblzma. Standard range is 0 to 4.\n", lc_param);
+            }
         } else {
             filenames[file_count++] = argv[i];
         }
     }
 
     if (file_count == 0) {
-        fprintf(stderr, "Usage: %s [--timeout=<seconds>] <input_file_1> [input_file_2 ...]\n", argv[0]);
+        fprintf(stderr, "Error: No input files specified.\n");
+        print_help(argv[0]);
+        free(filenames);
         return EXIT_FAILURE;
     }
 
@@ -195,7 +225,7 @@ int main(int argc, char **argv) {
         for (size_t j = 0; j < files[i].file_size; j++) {
             remapped_buf[j] = files[i].in_buf[j];
         }
-        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity);
+        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param);
         files[i].baseline_comp_size = s;
         baseline_sum += s;
     }
@@ -211,8 +241,9 @@ int main(int argc, char **argv) {
         for (size_t j = 0; j < files[i].file_size; j++) {
             remapped_buf[j] = current_remap[files[i].in_buf[j]];
         }
-        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity);
+        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param);
         files[i].current_comp_size = s;
+        files[i].milestone_comp_size = s; // The seed is our first milestone
         current_sum += s;
     }
     
@@ -242,12 +273,11 @@ int main(int argc, char **argv) {
         const char *op_type;
 
         if (is_defrag) {
-            int i = rand() % 255; // 0 to 254 inclusive
-            if (current_remap[i] == 0xFF) continue; // Skip if we cannot increment
+            int i = rand() % 255; 
+            if (current_remap[i] == 0xFF) continue; 
             
             uint8_t target_val = current_remap[i] + 1;
             int j = 0;
-            // Find where the target value is currently mapped
             for (; j < 256; j++) {
                 if (current_remap[j] == target_val) break;
             }
@@ -256,7 +286,7 @@ int main(int argc, char **argv) {
             idx2 = j;
             op_type = "defragment";
             
-            if (idx1 == idx2) continue; // Already defragmented here; don't waste evaluation
+            if (idx1 == idx2) continue; 
         } else {
             idx1 = rand() % 256;
             idx2 = rand() % 256;
@@ -275,7 +305,7 @@ int main(int argc, char **argv) {
             for (size_t j = 0; j < files[i].file_size; j++) {
                 remapped_buf[j] = current_remap[files[i].in_buf[j]];
             }
-            files[i].temp_comp_size = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity);
+            files[i].temp_comp_size = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param);
             new_sum += files[i].temp_comp_size;
         }
 
@@ -293,40 +323,50 @@ int main(int argc, char **argv) {
         }
 
         if (accept) {
+            // Apply temp state to current running state
             current_sum = new_sum;
             for (int i = 0; i < file_count; i++) {
                 files[i].current_comp_size = files[i].temp_comp_size;
             }
             
-            // Check against GLOBAL absolute minimum
-            if (current_sum < best_sum) {
-                best_sum = current_sum;
+            // Check against GLOBAL absolute minimum (Milestone)
+            if (new_sum < best_sum) {
                 
-                long long total_delta = (long long)best_sum - (long long)baseline_sum;
-                double total_pct = ((double)total_delta / (double)baseline_sum) * 100.0;
+                // Calculate total deltas
+                long long total_delta_base = (long long)new_sum - (long long)baseline_sum;
+                double total_pct_base = ((double)total_delta_base / (double)baseline_sum) * 100.0;
+                
+                long long total_delta_prev = (long long)new_sum - (long long)best_sum;
+                double total_pct_prev = ((double)total_delta_prev / (double)best_sum) * 100.0;
 
                 fprintf(stderr, "/* NEW GLOBAL BEST: %zu bytes (Iter %llu, Temp %.2f, Op: %s) */\n", 
-                        best_sum, iterations, temperature, op_type);
-                fprintf(stderr, "/* TOTAL DELTA vs IDENTITY: %lld bytes (%.2f%%) */\n", total_delta, total_pct);
+                        new_sum, iterations, temperature, op_type);
+                fprintf(stderr, "/* TOTAL IMPROVEMENT:\n");
+                fprintf(stderr, "      vs Identity:  %lld bytes (%+.2f%%)\n", total_delta_base, total_pct_base);
+                fprintf(stderr, "      vs Milestone: %lld bytes (%+.2f%%)\n", total_delta_prev, total_pct_prev);
+                fprintf(stderr, "*/\n");
                 
-                fprintf(stderr, "/* FILE METRICS vs IDENTITY:\n");
+                fprintf(stderr, "/* FILE METRICS:\n");
                 for (int i = 0; i < file_count; i++) {
-                    long long delta = (long long)files[i].current_comp_size - (long long)files[i].baseline_comp_size;
-                    double pct = ((double)delta / (double)files[i].baseline_comp_size) * 100.0;
+                    // Delta vs Identity
+                    long long delta_base = (long long)files[i].temp_comp_size - (long long)files[i].baseline_comp_size;
+                    double pct_base = ((double)delta_base / (double)files[i].baseline_comp_size) * 100.0;
                     
-                    if (delta < 0) {
-                        fprintf(stderr, "   [IMPROVED]  %s: %zu bytes (%lld bytes, %.2f%%)\n", 
-                                files[i].filename, files[i].current_comp_size, delta, pct);
-                    } else if (delta > 0) {
-                        fprintf(stderr, "   [REGRESSED] %s: %zu bytes (+%lld bytes, +%.2f%%)\n", 
-                                files[i].filename, files[i].current_comp_size, delta, pct);
-                    } else {
-                        fprintf(stderr, "   [UNCHANGED] %s: %zu bytes (0 bytes, 0.00%%)\n", 
-                                files[i].filename, files[i].current_comp_size);
-                    }
+                    // Delta vs Previous Milestone
+                    long long delta_prev = (long long)files[i].temp_comp_size - (long long)files[i].milestone_comp_size;
+                    double pct_prev = ((double)delta_prev / (double)files[i].milestone_comp_size) * 100.0;
+                    
+                    fprintf(stderr, "   - %s: %zu bytes\n", files[i].filename, files[i].temp_comp_size);
+                    fprintf(stderr, "       vs Idx:  %lld bytes (%+.2f%%)\n", delta_base, pct_base);
+                    fprintf(stderr, "       vs Prev: %lld bytes (%+.2f%%)\n", delta_prev, pct_prev);
+                    
+                    // Lock in this file's state for the new milestone
+                    files[i].milestone_comp_size = files[i].temp_comp_size;
                 }
                 fprintf(stderr, "*/\n");
                 
+                // Lock in the new global minimum
+                best_sum = new_sum;
                 print_remap_table_as_source(current_remap);
             }
         } else {
