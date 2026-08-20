@@ -17,6 +17,10 @@
  *    that minimizes entropy across the entire dataset.
  * 
  * 2. Tunable LZMA Markov Chain Modeling
+ *    - dict (Dictionary Size): Configurable via '--dict=' in KB (default: 4).
+ *      Defaults to the 4KB minimum to drastically increase evaluation speed and 
+ *      to force the objective function to rely heavily on the literal/entropy 
+ *      coding (Markov chains) rather than finding long historical LZ matches.
  *    - lc (Literal Context): Configurable via '--lc=' (default: 3). 
  *      Determines how many of the highest bits of the PREVIOUS byte are used as 
  *      the context to select the probability model for encoding the CURRENT byte. 
@@ -42,10 +46,10 @@
  *      modeling when evaluating serialized data streams.
  * 
  * 5. State & Milestone Tracking & Formatting
- *    - Baseline: Size under pure identity mapping (fixed anchor).
- *    - Milestone: Size at the last recorded global best (ratchets down).
- *    - Tabular Formatting: Calculates maximum filename width dynamically to 
- *      horizontally align all metric columns (sizes, byte deltas, percentages).
+ *    The algorithm maintains distinct evaluation anchors to track progress:
+ *    - Nonremapped (Baseline): Size under pure identity mapping.
+ *    - Initial: Size evaluated using the provided seed_remap array.
+ *    - Previous (Milestone): Size at the last recorded global best.
  * ==============================================================================
  */
 
@@ -57,31 +61,32 @@
  * using spaced character literals for perfect column alignment.
  */
 unsigned char seed_remap[256] = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-    ' ' , '!' , '"' , '#' , '$' , '%' , '&' , '\'', '(' , ')' , '*' , '+' , ',' , '-' , '.' , '/' ,
-    '0' , '1' , '2' , '3' , '4' , '5' , '6' , '7' , '8' , '9' , ':' , ';' , '<' , '=' , '>' , '?' ,
-    '@' , 'A' , 'B' , 'C' , 'D' , 'E' , 'F' , 'G' , 'H' , 'I' , 'J' , 'K' , 'L' , 'M' , 'N' , 'O' ,
-    'P' , 'Q' , 'R' , 'S' , 'T' , 'U' , 'V' , 'W' , 'X' , 'Y' , 'Z' , '[' , '\\', ']' , '^' , '_' ,
-    '`' , 'a' , 'b' , 'c' , 'd' , 'e' , 'f' , 'g' , 'h' , 'i' , 'j' , 'k' , 'l' , 'm' , 'n' , 'o' ,
-    'p' , 'q' , 'r' , 's' , 't' , 'u' , 'v' , 'w' , 'x' , 'y' , 'z' , '{' , '|' , '}' , '~' , 0x7f,
-    0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
-    0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
-    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
-    0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
-    0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
-    0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf,
-    0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
-    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
+    0xc9, 0x16, 0x17, 0xb5, ' ' , '!' , 0xdd, 0xac, '(' , ')' , 0xf9, 'v' , 't' , 0xdb, 0xd0, 0x08, 
+    0x93, 0x94, 0x95, 0x9e, 0xb8, 0x85, 0x99, 0xb9, 0xe4, '{' , '\'', 0x83, 0x9b, 0x8c, 0x8d, 0x0a, 
+    0xbe, 0xc0, 0xa1, 'X' , 0xa8, 0xa9, 0xc4, 0x9d, 0x05, 0xd1, 0xe7, 0xc6, 0xad, 0xae, 0xcd, 0xbf, 
+    0xe5, 0xb1, 0x9c, 0xd2, 0xfd, 0xfe, 0xda, 0xaf, 0xb0, 0xa5, 0xa6, 0xa7, 0xff, 'H' , 0xec, 0xd6, 
+    0xd7, 'T' , '^' , '_' , ']' , 'E' , '>' , '?' , 'Y' , 'S' , '.' , 0xbd, '&' , 'P' , 'Q' , 'R' , 
+    'N' , 'O' , 'A' , 'B' , 'C' , 'D' , '/' , 'L' , 'U' , '[' , '@' , 0xe1, 0xc3, 0xa0, 0x96, '8' , 
+    '4' , '`' , 'u' , 'h' , 'i' , 'b' , 'k' , 'l' , 'f' , 'g' , 'p' , 'q' , '~' , 0x7f, 'm' , 'e' , 
+    '}' , ',' , '|' , 'o' , 'n' , 'c' , 'x' , 'y' , 'z' , 'r' , '-' , '6' , 0x1b, 0x15, 'V' , 0x90, 
+    0xaa, 0xe3, 0xf6, 0x86, '1' , '%' , 0xbc, 0x11, 0x91, 0x92, 0xf1, 0x1f, 'd' , '#' , '$' , 'w' , 
+    0xdf, 'W' , 0x04, 0xe6, 0xd5, 0xe0, '5' , '\\', 0xc2, 0xf2, 0xcc, 0x1c, 0xa4, 0xe8, 0xfa, 0xea, 
+    0xeb, 0x0d, 0x0f, 'J' , 0xce, 0xd9, 0x02, 'Z' , 0x9f, 'a' , 0xab, '3' , 0xee, 0xb4, 0xf7, '0' , 
+    0x87, 0xed, 0x84, 0x98, 0x82, 0x18, 0xfb, 'I' , 0xc5, 0xba, 0xf5, 0xd4, '*' , 'F' , 'K' , 0x8e, 
+    0x9a, 0xf8, 0x0c, 0x8b, 's' , 0x07, 0xb7, 0xfc, 0x8f, 0xa2, 0xe2, 0x03, '9' , 0x10, 0xe9, 0x89, 
+    0xdc, 0x00, 0xf4, '2' , 0xef, 0xf0, 0x0b, 0x8a, 0xcf, 0x81, 0x14, 0x80, 0xd8, 0xca, 0x01, 0x1d, 
+    '<' , '=' , 0xde, 0xd3, 0xbb, '+' , 'M' , '7' , 0x09, 'j' , 0x1e, 0x0e, '"' , 0xc8, 0xa3, 0x88, 
+    0xc7, 0xf3, 0x97, 0xb6, 0xb3, 0xcb, 0x19, 0x1a, 'G' , 0x12, 0x06, ':' , 0x13, ';' , 0xc1, 0xb2
 };
 
 typedef struct {
     const char *filename;
     uint8_t *in_buf;
     size_t file_size;
-    size_t baseline_comp_size;  // Pure identity baseline
+    size_t baseline_comp_size;  // Pure identity baseline ("Nonremapped")
+    size_t initial_comp_size;   // Seed remap ("Initial")
     size_t current_comp_size;   // Evaluated size of the current working SA state
-    size_t milestone_comp_size; // Evaluated size at the last global best
+    size_t milestone_comp_size; // Evaluated size at the last global best ("Previous")
     size_t temp_comp_size;      // Evaluated size during a candidate mutation
 } FileData;
 
@@ -90,6 +95,7 @@ void print_help(const char *prog_name) {
     printf("Options:\n");
     printf("  --help          Show this help message and exit.\n");
     printf("  --timeout=SEC   Set timeout in seconds (default: 600).\n");
+    printf("  --dict=KB       Set LZMA dictionary size in kilobytes (default: 4).\n");
     printf("  --lc=BITS       Set LZMA literal context bits (0-4, default: 3).\n");
     printf("  --lp=BITS       Set LZMA literal position bits (0-4, default: 0).\n");
     printf("  --pb=BITS       Set LZMA position bits (0-4, default: 2).\n");
@@ -100,14 +106,17 @@ void print_help(const char *prog_name) {
 }
 
 // Function to evaluate the objective (compress buffer with tuned LZMA properties)
-size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, int lc_param, int lp_param, int pb_param) {
+size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
     lzma_options_lzma opt;
     if (lzma_lzma_preset(&opt, 0)) {
         fprintf(stderr, "Error: Failed to set LZMA preset.\n");
         exit(EXIT_FAILURE);
     }
     
-    opt.dict_size = LZMA_DICT_SIZE_MIN; 
+    // LZMA requires a minimum dictionary size of 4096 bytes (4 KB).
+    uint32_t dict_bytes = (uint32_t)dict_param_kb * 1024;
+    opt.dict_size = (dict_bytes < LZMA_DICT_SIZE_MIN) ? LZMA_DICT_SIZE_MIN : dict_bytes; 
+    
     opt.lc = lc_param;                         
     opt.lp = lp_param;                         
     opt.pb = pb_param;                         
@@ -159,6 +168,7 @@ void print_remap_table_as_source(const uint8_t *remap) {
 
 int main(int argc, char **argv) {
     int timeout = 600; 
+    int dict_param_kb = 4; // Updated default for increased speed & entropy coding priority
     int lc_param = 3; 
     int lp_param = 0;
     int pb_param = 2;
@@ -173,8 +183,10 @@ int main(int argc, char **argv) {
             return EXIT_SUCCESS;
         } else if (strncmp(argv[i], "--timeout=", 10) == 0) {
             timeout = atoi(argv[i] + 10);
-        } else if (strncmp(argv[i], "--timout=", 9) == 0) {
+        } else if (strncmp(argv[i], "--timout=", 9) == 0) { 
             timeout = atoi(argv[i] + 9);
+        } else if (strncmp(argv[i], "--dict=", 7) == 0) {
+            dict_param_kb = atoi(argv[i] + 7);
         } else if (strncmp(argv[i], "--lc=", 5) == 0) {
             lc_param = atoi(argv[i] + 5);
         } else if (strncmp(argv[i], "--lp=", 5) == 0) {
@@ -232,35 +244,37 @@ int main(int argc, char **argv) {
     size_t out_capacity = lzma_stream_buffer_bound(max_file_size);
     uint8_t *out_buf = malloc(out_capacity);
 
-    // 1. Evaluate True Baseline (Identity Mapping)
+    // 1. Evaluate True Baseline ("Nonremapped" / Identity Mapping)
     size_t baseline_sum = 0;
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
             remapped_buf[j] = files[i].in_buf[j];
         }
-        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param, lp_param, pb_param);
+        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
         files[i].baseline_comp_size = s;
         baseline_sum += s;
     }
     
     fprintf(stderr, "Original Identity Mapping Total Size: %zu bytes\n\n", baseline_sum);
 
-    // 2. Evaluate User Seed
+    // 2. Evaluate User Seed ("Initial")
     uint8_t current_remap[256];
     memcpy(current_remap, seed_remap, 256);
 
-    size_t current_sum = 0;
+    size_t initial_sum = 0;
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
             remapped_buf[j] = current_remap[files[i].in_buf[j]];
         }
-        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param, lp_param, pb_param);
+        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
+        files[i].initial_comp_size = s;
         files[i].current_comp_size = s;
-        files[i].milestone_comp_size = s; // The seed is our first milestone
-        current_sum += s;
+        files[i].milestone_comp_size = s; // First "Previous" milestone is the Initial state
+        initial_sum += s;
     }
     
-    size_t best_sum = current_sum;
+    size_t current_sum = initial_sum;
+    size_t best_sum = initial_sum;
     fprintf(stderr, "Starting Seed Total Size: %zu bytes\n\n", best_sum);
 
     srand((unsigned int)time(NULL));
@@ -318,7 +332,7 @@ int main(int argc, char **argv) {
             for (size_t j = 0; j < files[i].file_size; j++) {
                 remapped_buf[j] = current_remap[files[i].in_buf[j]];
             }
-            files[i].temp_comp_size = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param, lp_param, pb_param);
+            files[i].temp_comp_size = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
             new_sum += files[i].temp_comp_size;
         }
 
@@ -349,38 +363,45 @@ int main(int argc, char **argv) {
                 long long total_delta_base = (long long)new_sum - (long long)baseline_sum;
                 double total_pct_base = ((double)total_delta_base / (double)baseline_sum) * 100.0;
                 
+                long long total_delta_init = (long long)new_sum - (long long)initial_sum;
+                double total_pct_init = ((double)total_delta_init / (double)initial_sum) * 100.0;
+                
                 long long total_delta_prev = (long long)new_sum - (long long)best_sum;
                 double total_pct_prev = ((double)total_delta_prev / (double)best_sum) * 100.0;
 
-                fprintf(stderr, "/* NEW GLOBAL BEST: %zu bytes (Iter %llu, Temp %.2f, Op: %s, lc:%d/lp:%d/pb:%d) */\n", 
-                        new_sum, iterations, temperature, op_type, lc_param, lp_param, pb_param);
+                fprintf(stderr, "/* NEW GLOBAL BEST: %zu bytes (Iter %llu, Temp %.2f, Op: %s, dict:%dK/lc:%d/lp:%d/pb:%d) */\n", 
+                        new_sum, iterations, temperature, op_type, dict_param_kb, lc_param, lp_param, pb_param);
                 
                 fprintf(stderr, "/* TOTAL IMPROVEMENT:\n");
-                fprintf(stderr, "      vs Identity:  %lld bytes (%+.2f%%)\n", total_delta_base, total_pct_base);
-                fprintf(stderr, "      vs Milestone: %lld bytes (%+.2f%%)\n", total_delta_prev, total_pct_prev);
+                fprintf(stderr, "      vs Nonremapped: %lld bytes (%+.2f%%)\n", total_delta_base, total_pct_base);
+                fprintf(stderr, "      vs Initial:     %lld bytes (%+.2f%%)\n", total_delta_init, total_pct_init);
+                fprintf(stderr, "      vs Previous:    %lld bytes (%+.2f%%)\n", total_delta_prev, total_pct_prev);
                 fprintf(stderr, "*/\n");
                 
-                /*
-                 * Horizontally aligned column output using max_filename_len and fixed-width specifiers:
-                 * - Filename left-aligned to longest filename length (%-*s)
-                 * - Byte sizes, deltas, and percentages right-aligned to fixed widths
-                 */
-                fprintf(stderr, "/* FILE METRICS [vs Identity]:\n");
+                fprintf(stderr, "/* FILE METRICS [vs Nonremapped]:\n");
                 for (int i = 0; i < file_count; i++) {
-                    long long delta_base = (long long)files[i].temp_comp_size - (long long)files[i].baseline_comp_size;
-                    double pct_base = ((double)delta_base / (double)files[i].baseline_comp_size) * 100.0;
+                    long long delta = (long long)files[i].temp_comp_size - (long long)files[i].baseline_comp_size;
+                    double pct = ((double)delta / (double)files[i].baseline_comp_size) * 100.0;
                     fprintf(stderr, "   - %-*s : %10zu bytes (%+10lld B, %+7.2f%%)\n", 
-                            max_filename_len, files[i].filename, files[i].temp_comp_size, delta_base, pct_base);
+                            max_filename_len, files[i].filename, files[i].temp_comp_size, delta, pct);
                 }
                 
-                fprintf(stderr, "   FILE METRICS [vs Previous Milestone]:\n");
+                fprintf(stderr, "   FILE METRICS [vs Initial]:\n");
                 for (int i = 0; i < file_count; i++) {
-                    long long delta_prev = (long long)files[i].temp_comp_size - (long long)files[i].milestone_comp_size;
-                    double pct_prev = ((double)delta_prev / (double)files[i].milestone_comp_size) * 100.0;
+                    long long delta = (long long)files[i].temp_comp_size - (long long)files[i].initial_comp_size;
+                    double pct = ((double)delta / (double)files[i].initial_comp_size) * 100.0;
                     fprintf(stderr, "   - %-*s : %+10lld bytes (%+7.2f%%)\n", 
-                            max_filename_len, files[i].filename, delta_prev, pct_prev);
+                            max_filename_len, files[i].filename, delta, pct);
+                }
+                
+                fprintf(stderr, "   FILE METRICS [vs Previous]:\n");
+                for (int i = 0; i < file_count; i++) {
+                    long long delta = (long long)files[i].temp_comp_size - (long long)files[i].milestone_comp_size;
+                    double pct = ((double)delta / (double)files[i].milestone_comp_size) * 100.0;
+                    fprintf(stderr, "   - %-*s : %+10lld bytes (%+7.2f%%)\n", 
+                            max_filename_len, files[i].filename, delta, pct);
                     
-                    // Lock in this file's state for the new milestone
+                    // Lock in this file's state for the new sequential milestone
                     files[i].milestone_comp_size = files[i].temp_comp_size;
                 }
                 fprintf(stderr, "*/\n");
