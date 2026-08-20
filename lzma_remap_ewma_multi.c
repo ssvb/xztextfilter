@@ -11,45 +11,40 @@
  * ALGORITHM OVERVIEW: EWMA-Driven Cohabitation Optimizer with Chunk Normalization
  * ==============================================================================
  * 
+ * 0. Initialization & Optional State Randomization
+ *    The algorithm begins with a predefined 'seed_remap'. If the '--reshuffle' 
+ *    flag is provided, this initial seed is completely scrambled using a 
+ *    Fisher-Yates shuffle across the entire 256-byte domain.
+ * 
  * 1. The Global Objective (Multi-File Optimization)
  *    The objective function calculates the SUM of the compressed sizes of all 
- *    input files. This guides the search toward a universal byte permutation 
- *    that minimizes entropy across the entire dataset.
+ *    input files to guide the search toward a universal byte permutation.
  * 
  * 2. LZMA-Aligned Table Partitioning (The Invariant)
- *    Depending on the 'lc' (literal context) parameter, the 256-element remap 
- *    table is continuously partitioned into 2^lc equally sized chunks. To 
- *    maximize the efficiency of the LZMA Markov models, the algorithm enforces 
- *    a strict normalization invariant after every mutation:
+ *    The 256-element remap table is continuously partitioned into 2^lc equally 
+ *    sized chunks. The algorithm enforces a strict normalization invariant:
  *      - Values inside each chunk are sorted in ascending order.
  *      - The chunks themselves are sorted by the average (sum) of their elements.
  * 
  * 3. EWMA "Badness" Cohabitation Predictor
- *    Instead of blind random swaps, the algorithm tracks a 256x256 matrix 
- *    representing the Exponentially Weighted Moving Average (EWMA) "badness" 
- *    of having two specific byte values reside in the same chunk. 
- *    - 0.0 = Favorable (Good compression synergy)
- *    - 1.0 = Unfavorable (Poor compression synergy)
+ *    Tracks a 256x256 matrix representing the Exponentially Weighted Moving 
+ *    Average (EWMA) "badness" of having two specific byte values reside in the 
+ *    same chunk (0.0 = Favorable, 1.0 = Unfavorable).
  * 
- * 4. Stochastic Weighted Displacement Selection (8-Neighbor Subsampling)
- *    On each iteration, every element in the table is evaluated. Its "displacement 
- *    desirability" weight is calculated by summing the badness factors of 8 
- *    RANDOMLY CHOSEN elements currently sharing its chunk. The algorithm uses 
- *    roulette-wheel selection to pick two elements from *different* chunks based 
- *    on these weights. Subsampling introduces stochastic noise which prevents 
- *    stagnation in local minima.
+ * 4. Variable Perturbation Magnitude (1-pair vs 2-pair swaps)
+ *    To prevent getting trapped in local minima, the algorithm stochastically 
+ *    decides whether to swap a single pair (2 elements) or two distinct pairs 
+ *    (4 elements). Each pair is strictly selected from two *different* chunks, 
+ *    though a double-swap might bridge the same two chunks twice.
  * 
- * 5. Greedy Acceptance & Balanced EWMA Feedback Loop (8-Neighbor Subsampling)
- *    The selected pair is swapped, normalized, and evaluated. A balanced push-pull 
- *    feedback loop updates exactly 8 RANDOMLY CHOSEN neighbors for each swapped element:
- *      - IF IMPROVES (Favorable Swap): 
- *          * 8 NEW neighbors -> Favorable (0.0): Moving to them was a good idea.
- *          * 8 OLD neighbors -> Unfavorable (1.0): Moving away from them was a good idea.
- *      - IF DEGRADES (Unfavorable Swap): 
- *          * 8 NEW neighbors -> Unfavorable (1.0): Moving to them was a bad idea.
- *          * 8 OLD neighbors -> Favorable (0.0): Staying with them was better.
+ * 5. Greedy Acceptance & Balanced EWMA Feedback Loop (15-Neighbor Subsampling)
+ *    Once a mutation is proposed and evaluated, the feedback loop updates exactly 
+ *    15 randomly chosen neighbors for each swapped element. Expanding from 8 to 15 
+ *    neighbors provides a much more robust gradient estimation of the search space.
  * ==============================================================================
  */
+
+#define MAX_PICKS 15 // Increased neighborhood sampling size
 
 /* 
  * REPLACE THIS BLOCK with the output from stderr to use the best mapping 
@@ -78,16 +73,24 @@ typedef struct {
     const char *filename;
     uint8_t *in_buf;
     size_t file_size;
-    size_t baseline_comp_size;  // Pure identity baseline ("Nonremapped")
-    size_t initial_comp_size;   // Normalized seed remap ("Initial")
-    size_t current_comp_size;   // Evaluated size of the current working state
-    size_t milestone_comp_size; // Evaluated size at the last global best ("Previous")
-    size_t temp_comp_size;      // Evaluated size during a candidate mutation
+    size_t baseline_comp_size; 
+    size_t initial_comp_size;   
+    size_t current_comp_size;   
+    size_t milestone_comp_size; 
+    size_t temp_comp_size;      
 } FileData;
 
 // EWMA predictor matrix [byte_val1][byte_val2]
 double ewma_badness[256][256];
-const double EWMA_ALPHA = 0.15; // Learning rate
+
+/**
+ * Algorithm: Aggressive Exponential Smoothing
+ * -------------------------------------------
+ * Set highly reactive (0.60). This ensures the badness matrix updates rapidly 
+ * based on recent accept/reject evaluations, preventing the algorithm from 
+ * stagnating on deeply entrenched but outdated historical data.
+ */
+const double EWMA_ALPHA = 0.60; 
 
 void print_help(const char *prog_name) {
     printf("Usage: %s [OPTIONS] <input_file_1> [input_file_2 ...]\n\n", prog_name);
@@ -98,14 +101,10 @@ void print_help(const char *prog_name) {
     printf("  --lc=BITS       Set LZMA literal context bits (1-4, default: 3).\n");
     printf("  --lp=BITS       Set LZMA literal position bits (0-4, default: 0).\n");
     printf("  --pb=BITS       Set LZMA position bits (0-4, default: 2).\n");
-    printf("\n");
-    printf("Description:\n");
-    printf("  Optimizes byte mappings using EWMA Tabu-like Search with strict Chunk Normalization.\n");
+    printf("  --reshuffle     Randomly shuffle the initial mapping before optimization.\n");
 }
 
-// -------------------------------------------------------------------------
 // Helper: Select distinct random neighbor indices from within a chunk
-// -------------------------------------------------------------------------
 void get_random_neighbors(int chunk_size, int elem_idx_in_chunk, int num_picks, int *picks) {
     int count = 0;
     while (count < num_picks) {
@@ -129,7 +128,7 @@ void get_random_neighbors(int chunk_size, int elem_idx_in_chunk, int num_picks, 
     }
 }
 
-// Function to enforce the structural invariant on the remap table
+// Enforces structural invariant on the remap table
 void normalize_remap(uint8_t *remap, int lc) {
     int num_chunks = 1 << lc;
     int chunk_size = 256 / num_chunks;
@@ -192,7 +191,6 @@ void normalize_remap(uint8_t *remap, int lc) {
     }
 }
 
-// Evaluate the objective (compress buffer with tuned LZMA properties)
 size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
     lzma_options_lzma opt;
     if (lzma_lzma_preset(&opt, 0)) {
@@ -220,32 +218,22 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
     return (ret == LZMA_OK) ? out_pos : out_capacity + 1;
 }
 
-// Helper function to print bytes with space padding for alignment
 void print_byte_literal(FILE *out, uint8_t b) {
     if (b >= 32 && b <= 126) {
-        if (b == '\'') {
-            fprintf(out, "'\\''"); 
-        } else if (b == '\\') {
-            fprintf(out, "'\\\\'"); 
-        } else {
-            fprintf(out, "'%c' ", b); 
-        }
+        if (b == '\'') fprintf(out, "'\\''"); 
+        else if (b == '\\') fprintf(out, "'\\\\'"); 
+        else fprintf(out, "'%c' ", b); 
     } else {
         fprintf(out, "0x%02x", b); 
     }
 }
 
-// Dumps the current best mapping exactly as a perfectly aligned C array
 void print_remap_table_as_source(const uint8_t *remap) {
     fprintf(stderr, "unsigned char seed_remap[256] = {\n    ");
     for (int i = 0; i < 256; i++) {
         print_byte_literal(stderr, remap[i]);
-        if (i < 255) {
-            fprintf(stderr, ", ");
-        }
-        if ((i + 1) % 16 == 0 && i < 255) {
-            fprintf(stderr, "\n    ");
-        }
+        if (i < 255) fprintf(stderr, ", ");
+        if ((i + 1) % 16 == 0 && i < 255) fprintf(stderr, "\n    ");
     }
     fprintf(stderr, "\n};\n\n");
     fflush(stderr); 
@@ -255,12 +243,46 @@ double random_double() {
     return (double)rand() / (double)RAND_MAX;
 }
 
+/**
+ * Algorithm: Stochastic Weighted Selection (Roulette Wheel Filter)
+ * -----------------------------------------------------------------
+ * Safely executes roulette-wheel selection over the calculated EWMA 
+ * 'desirability' weights. Includes strict exclusion parameters to guarantee:
+ *   1. We can force selection from a distinct chunk (exclude_chunk).
+ *   2. We can prevent overlaps/collisions with already selected elements 
+ *      during multi-pair swaps (exclude_idx1 ... exclude_idx3).
+ */
+int roulette_select(double *weights, int chunk_size, int exclude_chunk, int exclude_idx1, int exclude_idx2, int exclude_idx3) {
+    double total_weight = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (exclude_chunk >= 0 && (i / chunk_size) == exclude_chunk) continue;
+        if (i == exclude_idx1 || i == exclude_idx2 || i == exclude_idx3) continue;
+        total_weight += weights[i];
+    }
+    
+    if (total_weight <= 0.0) return -1; 
+    
+    double r = random_double() * total_weight;
+    double accum = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (exclude_chunk >= 0 && (i / chunk_size) == exclude_chunk) continue;
+        if (i == exclude_idx1 || i == exclude_idx2 || i == exclude_idx3) continue;
+        
+        accum += weights[i];
+        if (accum >= r) return i;
+    }
+    return -1;
+}
+
 int main(int argc, char **argv) {
+    srand((unsigned int)time(NULL));
+
     int timeout = 600; 
     int dict_param_kb = 4;
     int lc_param = 3; 
     int lp_param = 0;
     int pb_param = 2;
+    int do_reshuffle = 0;
     
     const char **filenames = malloc(argc * sizeof(char*));
     int file_count = 0;
@@ -272,8 +294,6 @@ int main(int argc, char **argv) {
             return EXIT_SUCCESS;
         } else if (strncmp(argv[i], "--timeout=", 10) == 0) {
             timeout = atoi(argv[i] + 10);
-        } else if (strncmp(argv[i], "--timout=", 9) == 0) { 
-            timeout = atoi(argv[i] + 9);
         } else if (strncmp(argv[i], "--dict=", 7) == 0) {
             dict_param_kb = atoi(argv[i] + 7);
         } else if (strncmp(argv[i], "--lc=", 5) == 0) {
@@ -282,6 +302,8 @@ int main(int argc, char **argv) {
             lp_param = atoi(argv[i] + 5);
         } else if (strncmp(argv[i], "--pb=", 5) == 0) {
             pb_param = atoi(argv[i] + 5);
+        } else if (strcmp(argv[i], "--reshuffle") == 0) {
+            do_reshuffle = 1;
         } else {
             filenames[file_count++] = argv[i];
         }
@@ -289,7 +311,6 @@ int main(int argc, char **argv) {
 
     if (file_count == 0) {
         fprintf(stderr, "Error: No input files specified.\n");
-        print_help(argv[0]);
         free(filenames);
         return EXIT_FAILURE;
     }
@@ -303,8 +324,8 @@ int main(int argc, char **argv) {
     int num_chunks = 1 << lc_param;
     int chunk_size = 256 / num_chunks;
     
-    // Safety bound: Request 8 neighbors, unless the chunk is extremely small
-    int num_picks = (chunk_size - 1 < 8) ? (chunk_size - 1) : 8;
+    // Bounds Check: Request MAX_PICKS (15) unless chunk is too small
+    int num_picks = (chunk_size - 1 < MAX_PICKS) ? (chunk_size - 1) : MAX_PICKS;
 
     FileData *files = malloc(file_count * sizeof(FileData));
     size_t max_file_size = 0;
@@ -314,29 +335,19 @@ int main(int argc, char **argv) {
         files[i].filename = filenames[i];
         
         int fn_len = (int)strlen(filenames[i]);
-        if (fn_len > max_filename_len) {
-            max_filename_len = fn_len;
-        }
+        if (fn_len > max_filename_len) max_filename_len = fn_len;
 
         FILE *f = fopen(filenames[i], "rb");
-        if (!f) {
-            fprintf(stderr, "Failed to open %s\n", filenames[i]);
-            return EXIT_FAILURE;
-        }
+        if (!f) return EXIT_FAILURE;
 
         fseek(f, 0, SEEK_END);
         files[i].file_size = (size_t)ftell(f);
         fseek(f, 0, SEEK_SET);
 
-        if (files[i].file_size > max_file_size) {
-            max_file_size = files[i].file_size;
-        }
+        if (files[i].file_size > max_file_size) max_file_size = files[i].file_size;
 
         files[i].in_buf = malloc(files[i].file_size);
-        if (fread(files[i].in_buf, 1, files[i].file_size, f) != files[i].file_size) {
-            fprintf(stderr, "Error reading %s\n", filenames[i]);
-            return EXIT_FAILURE;
-        }
+        if (fread(files[i].in_buf, 1, files[i].file_size, f) != files[i].file_size) return EXIT_FAILURE;
         fclose(f);
     }
 
@@ -344,35 +355,41 @@ int main(int argc, char **argv) {
     size_t out_capacity = lzma_stream_buffer_bound(max_file_size);
     uint8_t *out_buf = malloc(out_capacity);
 
-    // Initialize EWMA Predictor Matrix to a neutral 0.5 badness
+    // Initialize EWMA Matrix
     for (int i = 0; i < 256; i++) {
         for (int j = 0; j < 256; j++) {
             ewma_badness[i][j] = 0.5;
         }
     }
 
-    // 1. Evaluate True Baseline ("Nonremapped" / Identity Mapping)
+    // 1. Evaluate True Baseline
     size_t baseline_sum = 0;
     for (int i = 0; i < file_count; i++) {
-        for (size_t j = 0; j < files[i].file_size; j++) {
-            remapped_buf[j] = files[i].in_buf[j];
-        }
+        for (size_t j = 0; j < files[i].file_size; j++) remapped_buf[j] = files[i].in_buf[j];
         size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
         files[i].baseline_comp_size = s;
         baseline_sum += s;
     }
     fprintf(stderr, "Original Identity Mapping Total Size: %zu bytes\n\n", baseline_sum);
 
-    // 2. Evaluate User Seed (Normalized into valid invariant form)
+    // 2. Evaluate User Seed
     uint8_t current_remap[256];
     memcpy(current_remap, seed_remap, 256);
-    normalize_remap(current_remap, lc_param); // Force the initial structure
+
+    if (do_reshuffle) {
+        for (int i = 255; i > 0; i--) {
+            int j = rand() % (i + 1);
+            uint8_t temp = current_remap[i];
+            current_remap[i] = current_remap[j];
+            current_remap[j] = temp;
+        }
+    }
+
+    normalize_remap(current_remap, lc_param); 
 
     size_t initial_sum = 0;
     for (int i = 0; i < file_count; i++) {
-        for (size_t j = 0; j < files[i].file_size; j++) {
-            remapped_buf[j] = current_remap[files[i].in_buf[j]];
-        }
+        for (size_t j = 0; j < files[i].file_size; j++) remapped_buf[j] = current_remap[files[i].in_buf[j]];
         size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
         files[i].initial_comp_size = s;
         files[i].current_comp_size = s;
@@ -384,7 +401,6 @@ int main(int argc, char **argv) {
     size_t best_sum = initial_sum;
     fprintf(stderr, "Normalized Starting Seed Total Size: %zu bytes\n\n", best_sum);
 
-    srand((unsigned int)time(NULL));
     time_t start_time = time(NULL);
     unsigned long long iterations = 0;
 
@@ -398,7 +414,7 @@ int main(int argc, char **argv) {
 
         iterations++;
 
-        // 3. Evaluate Displacement Desirability Weights (Using 8 Random Neighbors)
+        // 3. Evaluate Displacement Desirability Weights (Using 15 Random Neighbors)
         double weights[256];
         double total_weight = 0.0;
         
@@ -408,8 +424,7 @@ int main(int argc, char **argv) {
             double badness_sum = 0.0;
             uint8_t elem = current_remap[i];
             
-            // Randomly select 8 distinct neighbors from the same chunk
-            int picks[8];
+            int picks[MAX_PICKS];
             get_random_neighbors(chunk_size, i - start, num_picks, picks);
             
             for (int k = 0; k < num_picks; k++) {
@@ -417,130 +432,171 @@ int main(int argc, char **argv) {
                 badness_sum += ewma_badness[elem][neighbor];
             }
 
-            // Add a small epsilon to ensure even 'perfect' chunks have a tiny chance to mutate
-            weights[i] = badness_sum + 0.01; 
+            /**
+             * Algorithm: Non-linear Weight Scaling (Polynomial Penalty)
+             * ---------------------------------------------------------
+             * To make higher badness result in *noticeably larger* random 
+             * weights, we apply a cubic transformation. A linear scale allows 
+             * for a 2x selection probability between a badness of 10 and 5. 
+             * A cubic scale (10^3 = 1000 vs 5^3 = 125) drastically magnifies 
+             * the gap to an 8x selection probability, forcing the roulette wheel 
+             * to mercilessly evict the worst cohabiting byte values.
+             */
+            weights[i] = (badness_sum * badness_sum * badness_sum) + 0.01; 
             total_weight += weights[i];
         }
 
-        // 4. Roulette-Wheel Selection (Pick idx1)
-        double r1 = random_double() * total_weight;
-        int idx1 = 0;
-        double accum = 0.0;
-        for (int i = 0; i < 256; i++) {
-            accum += weights[i];
-            if (accum >= r1) {
-                idx1 = i;
-                break;
-            }
-        }
-
-        // 5. Roulette-Wheel Selection (Pick idx2 from a DIFFERENT chunk)
-        int c1 = idx1 / chunk_size;
-        double total_weight2 = 0.0;
-        for (int i = 0; i < 256; i++) {
-            if (i / chunk_size != c1) {
-                total_weight2 += weights[i];
-            }
-        }
+        // 4. Algorithm: Multi-Pair Extraction
+        // -----------------------------------
+        // Standard Operation: Swap exactly 1 pair (idx1, idx2) spanning different chunks.
+        // Probabilistic Operation (30% chance): Swap 2 distinct pairs (idx1/idx2 AND idx3/idx4) 
+        // to escape local minima via a larger spatial jump.
+        int idx1 = roulette_select(weights, chunk_size, -1, -1, -1, -1);
+        int idx2 = roulette_select(weights, chunk_size, (idx1 / chunk_size), idx1, -1, -1);
         
-        double r2 = random_double() * total_weight2;
-        int idx2 = 0;
-        accum = 0.0;
-        for (int i = 0; i < 256; i++) {
-            if (i / chunk_size != c1) {
-                accum += weights[i];
-                if (accum >= r2) {
-                    idx2 = i;
-                    break;
-                }
+        int do_double_swap = 0;
+        int idx3 = -1, idx4 = -1;
+        uint8_t e3 = 0, e4 = 0;
+
+        if (random_double() < 0.30) {
+            idx3 = roulette_select(weights, chunk_size, -1, idx1, idx2, -1);
+            if (idx3 != -1) {
+                // Ensure idx4 is in a different chunk than idx3, and completely distinct from 1, 2, and 3
+                idx4 = roulette_select(weights, chunk_size, (idx3 / chunk_size), idx1, idx2, idx3);
+            }
+            if (idx3 != -1 && idx4 != -1) {
+                do_double_swap = 1;
             }
         }
 
-        // 6. Propose the Mutation
+        // 5. Propose the Mutation
         uint8_t proposed_remap[256];
         memcpy(proposed_remap, current_remap, 256);
         
         uint8_t e1 = proposed_remap[idx1];
         uint8_t e2 = proposed_remap[idx2];
-        
         proposed_remap[idx1] = e2;
         proposed_remap[idx2] = e1;
         
-        // Strictly restore the chunking and sorting invariant on the proposed state
+        if (do_double_swap) {
+            e3 = proposed_remap[idx3];
+            e4 = proposed_remap[idx4];
+            proposed_remap[idx3] = e4;
+            proposed_remap[idx4] = e3;
+        }
+        
         normalize_remap(proposed_remap, lc_param);
 
-        // 7. Evaluation Phase
+        // 6. Evaluation Phase
         size_t new_sum = 0;
         for (int i = 0; i < file_count; i++) {
-            for (size_t j = 0; j < files[i].file_size; j++) {
-                remapped_buf[j] = proposed_remap[files[i].in_buf[j]];
-            }
+            for (size_t j = 0; j < files[i].file_size; j++) remapped_buf[j] = proposed_remap[files[i].in_buf[j]];
             files[i].temp_comp_size = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
             new_sum += files[i].temp_comp_size;
         }
 
-        // 8. Capture Original and Proposed Chunk Boundaries for Balanced EWMA Updates
+        // 7. Capture Original and Proposed Chunk Boundaries for Balanced EWMA Updates
         
-        // OLD locations (from current_remap)
+        // PAIR 1 Boundaries
         int old_c1 = idx1 / chunk_size;
         int old_c2 = idx2 / chunk_size;
         int old_start1 = old_c1 * chunk_size;
         int old_start2 = old_c2 * chunk_size;
+        int new_idx1 = -1, new_idx2 = -1, new_idx3 = -1, new_idx4 = -1;
 
-        // NEW locations (from proposed_remap)
-        int new_idx1 = -1, new_idx2 = -1;
         for (int i = 0; i < 256; i++) {
             if (proposed_remap[i] == e1) new_idx1 = i;
             if (proposed_remap[i] == e2) new_idx2 = i;
+            if (do_double_swap) {
+                if (proposed_remap[i] == e3) new_idx3 = i;
+                if (proposed_remap[i] == e4) new_idx4 = i;
+            }
         }
+        
         int new_c1 = new_idx1 / chunk_size;
         int new_c2 = new_idx2 / chunk_size;
         int new_start1 = new_c1 * chunk_size;
         int new_start2 = new_c2 * chunk_size;
 
-        // Select exactly 8 (or chunk size - 1) distinct random neighbors for EWMA updating
-        int old_picks1[8], old_picks2[8], new_picks1[8], new_picks2[8];
+        int old_picks1[MAX_PICKS], old_picks2[MAX_PICKS], new_picks1[MAX_PICKS], new_picks2[MAX_PICKS];
         get_random_neighbors(chunk_size, idx1 - old_start1, num_picks, old_picks1);
         get_random_neighbors(chunk_size, idx2 - old_start2, num_picks, old_picks2);
         get_random_neighbors(chunk_size, new_idx1 - new_start1, num_picks, new_picks1);
         get_random_neighbors(chunk_size, new_idx2 - new_start2, num_picks, new_picks2);
 
-        // 9. Acceptance Criterion & Balanced Push-Pull EWMA Weight Updating
-        if (new_sum < current_sum) {
-            // ACCEPT: The swap improves (or maintains) compressibility
+        // PAIR 2 Boundaries (Conditionally generated)
+        int old_c3 = -1, old_c4 = -1, new_c3 = -1, new_c4 = -1;
+        int old_start3 = 0, old_start4 = 0, new_start3 = 0, new_start4 = 0;
+        int old_picks3[MAX_PICKS], old_picks4[MAX_PICKS], new_picks3[MAX_PICKS], new_picks4[MAX_PICKS];
+        
+        if (do_double_swap) {
+            old_c3 = idx3 / chunk_size;
+            old_c4 = idx4 / chunk_size;
+            new_c3 = new_idx3 / chunk_size;
+            new_c4 = new_idx4 / chunk_size;
             
-            // 1. OLD neighbors push towards Unfavorable (1.0) -> because leaving them helped
+            old_start3 = old_c3 * chunk_size;
+            old_start4 = old_c4 * chunk_size;
+            new_start3 = new_c3 * chunk_size;
+            new_start4 = new_c4 * chunk_size;
+            
+            get_random_neighbors(chunk_size, idx3 - old_start3, num_picks, old_picks3);
+            get_random_neighbors(chunk_size, idx4 - old_start4, num_picks, old_picks4);
+            get_random_neighbors(chunk_size, new_idx3 - new_start3, num_picks, new_picks3);
+            get_random_neighbors(chunk_size, new_idx4 - new_start4, num_picks, new_picks4);
+        }
+
+        // 8. Acceptance Criterion & Balanced Push-Pull EWMA Weight Updating
+        if (new_sum < current_sum) {
+            // ACCEPT: The swap improves compressibility
+            // -----------------------------------------------------------
+            // OLD neighbors push -> Unfavorable (1.0) (leaving them helped)
+            // NEW neighbors push -> Favorable (0.0)   (joining them helped)
+            
+            // --- PAIR 1 EWMA UPDATES ---
             for (int k = 0; k < num_picks; k++) {
-                uint8_t old_neighbor = current_remap[old_start1 + old_picks1[k]];
-                ewma_badness[e1][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][old_neighbor] + EWMA_ALPHA * 1.0;
-                ewma_badness[old_neighbor][e1] = ewma_badness[e1][old_neighbor]; // Symmetric
-            }
-            for (int k = 0; k < num_picks; k++) {
-                uint8_t old_neighbor = current_remap[old_start2 + old_picks2[k]];
-                ewma_badness[e2][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][old_neighbor] + EWMA_ALPHA * 1.0;
-                ewma_badness[old_neighbor][e2] = ewma_badness[e2][old_neighbor];
+                uint8_t old_n = current_remap[old_start1 + old_picks1[k]];
+                ewma_badness[e1][old_n] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][old_n] + EWMA_ALPHA * 1.0;
+                ewma_badness[old_n][e1] = ewma_badness[e1][old_n]; 
+
+                uint8_t old_n2 = current_remap[old_start2 + old_picks2[k]];
+                ewma_badness[e2][old_n2] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][old_n2] + EWMA_ALPHA * 1.0;
+                ewma_badness[old_n2][e2] = ewma_badness[e2][old_n2];
+
+                uint8_t new_n = proposed_remap[new_start1 + new_picks1[k]];
+                ewma_badness[e1][new_n] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][new_n] + EWMA_ALPHA * 0.0;
+                ewma_badness[new_n][e1] = ewma_badness[e1][new_n]; 
+
+                uint8_t new_n2 = proposed_remap[new_start2 + new_picks2[k]];
+                ewma_badness[e2][new_n2] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][new_n2] + EWMA_ALPHA * 0.0;
+                ewma_badness[new_n2][e2] = ewma_badness[e2][new_n2];
             }
 
-            // 2. NEW neighbors push towards Favorable (0.0) -> because joining them helped
-            for (int k = 0; k < num_picks; k++) {
-                uint8_t new_neighbor = proposed_remap[new_start1 + new_picks1[k]];
-                ewma_badness[e1][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][new_neighbor] + EWMA_ALPHA * 0.0;
-                ewma_badness[new_neighbor][e1] = ewma_badness[e1][new_neighbor]; 
-            }
-            for (int k = 0; k < num_picks; k++) {
-                uint8_t new_neighbor = proposed_remap[new_start2 + new_picks2[k]];
-                ewma_badness[e2][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][new_neighbor] + EWMA_ALPHA * 0.0;
-                ewma_badness[new_neighbor][e2] = ewma_badness[e2][new_neighbor];
+            // --- PAIR 2 EWMA UPDATES ---
+            if (do_double_swap) {
+                for (int k = 0; k < num_picks; k++) {
+                    uint8_t old_n3 = current_remap[old_start3 + old_picks3[k]];
+                    ewma_badness[e3][old_n3] = (1.0 - EWMA_ALPHA) * ewma_badness[e3][old_n3] + EWMA_ALPHA * 1.0;
+                    ewma_badness[old_n3][e3] = ewma_badness[e3][old_n3]; 
+
+                    uint8_t old_n4 = current_remap[old_start4 + old_picks4[k]];
+                    ewma_badness[e4][old_n4] = (1.0 - EWMA_ALPHA) * ewma_badness[e4][old_n4] + EWMA_ALPHA * 1.0;
+                    ewma_badness[old_n4][e4] = ewma_badness[e4][old_n4];
+
+                    uint8_t new_n3 = proposed_remap[new_start3 + new_picks3[k]];
+                    ewma_badness[e3][new_n3] = (1.0 - EWMA_ALPHA) * ewma_badness[e3][new_n3] + EWMA_ALPHA * 0.0;
+                    ewma_badness[new_n3][e3] = ewma_badness[e3][new_n3]; 
+
+                    uint8_t new_n4 = proposed_remap[new_start4 + new_picks4[k]];
+                    ewma_badness[e4][new_n4] = (1.0 - EWMA_ALPHA) * ewma_badness[e4][new_n4] + EWMA_ALPHA * 0.0;
+                    ewma_badness[new_n4][e4] = ewma_badness[e4][new_n4];
+                }
             }
 
-            // Apply the proposed mapping to the current state
             memcpy(current_remap, proposed_remap, 256);
             current_sum = new_sum;
-            for (int i = 0; i < file_count; i++) {
-                files[i].current_comp_size = files[i].temp_comp_size;
-            }
+            for (int i = 0; i < file_count; i++) files[i].current_comp_size = files[i].temp_comp_size;
 
-            // Check against GLOBAL absolute minimum
             if (new_sum < best_sum) {
                 long long total_delta_base = (long long)new_sum - (long long)baseline_sum;
                 double total_pct_base = ((double)total_delta_base / (double)baseline_sum) * 100.0;
@@ -553,6 +609,38 @@ int main(int argc, char **argv) {
 
                 fprintf(stderr, "/* NEW GLOBAL BEST: %zu bytes (Iter %llu, dict:%dK/lc:%d/lp:%d/pb:%d) */\n", 
                         new_sum, iterations, dict_param_kb, lc_param, lp_param, pb_param);
+                
+                // ---------------------------------------------------------------------------------
+                // Algorithm Debugging: Intermediate Mutation & Probability Report
+                // ---------------------------------------------------------------------------------
+                // Outputs the exact structural displacement of the values alongside a 16x16 grid 
+                // tracking the overall probability landscape mapped by the EWMA matrix.
+                fprintf(stderr, "/* MUTATION DETAILS:\n");
+                fprintf(stderr, "   Type: %s\n", do_double_swap ? "Double Swap (4 unique values)" : "Single Swap (2 unique values)");
+                
+                fprintf(stderr, "   Pair 1:\n");
+                fprintf(stderr, "     - Value 0x%02x moved from Chunk %d to %d (Weight: %.4f, Base Prob: %5.2f%%)\n", 
+                        e1, old_c1, new_c1, weights[idx1], (weights[idx1]/total_weight)*100.0);
+                fprintf(stderr, "     - Value 0x%02x moved from Chunk %d to %d (Weight: %.4f, Base Prob: %5.2f%%)\n", 
+                        e2, old_c2, new_c2, weights[idx2], (weights[idx2]/total_weight)*100.0);
+                
+                if (do_double_swap) {
+                    fprintf(stderr, "   Pair 2:\n");
+                    fprintf(stderr, "     - Value 0x%02x moved from Chunk %d to %d (Weight: %.4f, Base Prob: %5.2f%%)\n", 
+                            e3, old_c3, new_c3, weights[idx3], (weights[idx3]/total_weight)*100.0);
+                    fprintf(stderr, "     - Value 0x%02x moved from Chunk %d to %d (Weight: %.4f, Base Prob: %5.2f%%)\n", 
+                            e4, old_c4, new_c4, weights[idx4], (weights[idx4]/total_weight)*100.0);
+                }
+
+                fprintf(stderr, "\n   BASE SELECTION PROBABILITIES (%%) [16x16 Mapping Array]:\n");
+                for (int r = 0; r < 16; r++) {
+                    fprintf(stderr, "   ");
+                    for (int c = 0; c < 16; c++) {
+                        fprintf(stderr, "%5.2f ", (weights[r*16+c] / total_weight) * 100.0);
+                    }
+                    fprintf(stderr, "\n");
+                }
+                fprintf(stderr, "*/\n");
                 
                 fprintf(stderr, "/* TOTAL IMPROVEMENT:\n");
                 fprintf(stderr, "      vs Nonremapped: %lld bytes (%+.2f%%)\n", total_delta_base, total_pct_base);
@@ -591,40 +679,56 @@ int main(int argc, char **argv) {
                 print_remap_table_as_source(current_remap);
             }
         } else {
-            // REJECT: Compressibility degraded, do not merge proposed_remap
-            
-            // 1. NEW (attempted) neighbors push towards Unfavorable (1.0) -> because joining them hurt
+            // REJECT: Compressibility degraded
+            // -----------------------------------------------------------
+            // NEW neighbors push -> Unfavorable (1.0) (joining them hurt)
+            // OLD neighbors push -> Favorable (0.0)   (staying was better)
+
+            // --- PAIR 1 EWMA UPDATES ---
             for (int k = 0; k < num_picks; k++) {
-                uint8_t new_neighbor = proposed_remap[new_start1 + new_picks1[k]];
-                ewma_badness[e1][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][new_neighbor] + EWMA_ALPHA * 1.0;
-                ewma_badness[new_neighbor][e1] = ewma_badness[e1][new_neighbor];
-            }
-            for (int k = 0; k < num_picks; k++) {
-                uint8_t new_neighbor = proposed_remap[new_start2 + new_picks2[k]];
-                ewma_badness[e2][new_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][new_neighbor] + EWMA_ALPHA * 1.0;
-                ewma_badness[new_neighbor][e2] = ewma_badness[e2][new_neighbor];
+                uint8_t new_n = proposed_remap[new_start1 + new_picks1[k]];
+                ewma_badness[e1][new_n] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][new_n] + EWMA_ALPHA * 1.0;
+                ewma_badness[new_n][e1] = ewma_badness[e1][new_n];
+
+                uint8_t new_n2 = proposed_remap[new_start2 + new_picks2[k]];
+                ewma_badness[e2][new_n2] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][new_n2] + EWMA_ALPHA * 1.0;
+                ewma_badness[new_n2][e2] = ewma_badness[e2][new_n2];
+
+                uint8_t old_n = current_remap[old_start1 + old_picks1[k]];
+                ewma_badness[e1][old_n] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][old_n] + EWMA_ALPHA * 0.0;
+                ewma_badness[old_n][e1] = ewma_badness[e1][old_n];
+
+                uint8_t old_n2 = current_remap[old_start2 + old_picks2[k]];
+                ewma_badness[e2][old_n2] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][old_n2] + EWMA_ALPHA * 0.0;
+                ewma_badness[old_n2][e2] = ewma_badness[e2][old_n2];
             }
 
-            // 2. OLD (existing) neighbors push towards Favorable (0.0) -> because staying with them was better
-            for (int k = 0; k < num_picks; k++) {
-                uint8_t old_neighbor = current_remap[old_start1 + old_picks1[k]];
-                ewma_badness[e1][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e1][old_neighbor] + EWMA_ALPHA * 0.0;
-                ewma_badness[old_neighbor][e1] = ewma_badness[e1][old_neighbor];
-            }
-            for (int k = 0; k < num_picks; k++) {
-                uint8_t old_neighbor = current_remap[old_start2 + old_picks2[k]];
-                ewma_badness[e2][old_neighbor] = (1.0 - EWMA_ALPHA) * ewma_badness[e2][old_neighbor] + EWMA_ALPHA * 0.0;
-                ewma_badness[old_neighbor][e2] = ewma_badness[e2][old_neighbor];
+            // --- PAIR 2 EWMA UPDATES ---
+            if (do_double_swap) {
+                for (int k = 0; k < num_picks; k++) {
+                    uint8_t new_n3 = proposed_remap[new_start3 + new_picks3[k]];
+                    ewma_badness[e3][new_n3] = (1.0 - EWMA_ALPHA) * ewma_badness[e3][new_n3] + EWMA_ALPHA * 1.0;
+                    ewma_badness[new_n3][e3] = ewma_badness[e3][new_n3];
+
+                    uint8_t new_n4 = proposed_remap[new_start4 + new_picks4[k]];
+                    ewma_badness[e4][new_n4] = (1.0 - EWMA_ALPHA) * ewma_badness[e4][new_n4] + EWMA_ALPHA * 1.0;
+                    ewma_badness[new_n4][e4] = ewma_badness[e4][new_n4];
+
+                    uint8_t old_n3 = current_remap[old_start3 + old_picks3[k]];
+                    ewma_badness[e3][old_n3] = (1.0 - EWMA_ALPHA) * ewma_badness[e3][old_n3] + EWMA_ALPHA * 0.0;
+                    ewma_badness[old_n3][e3] = ewma_badness[e3][old_n3];
+
+                    uint8_t old_n4 = current_remap[old_start4 + old_picks4[k]];
+                    ewma_badness[e4][old_n4] = (1.0 - EWMA_ALPHA) * ewma_badness[e4][old_n4] + EWMA_ALPHA * 0.0;
+                    ewma_badness[old_n4][e4] = ewma_badness[e4][old_n4];
+                }
             }
         }
     }
 
     fprintf(stderr, "/* Search finished. Iterations: %llu. Final Best Sum: %zu bytes */\n", iterations, best_sum);
 
-    // Cleanup
-    for (int i = 0; i < file_count; i++) {
-        free(files[i].in_buf);
-    }
+    for (int i = 0; i < file_count; i++) free(files[i].in_buf);
     free(files);
     free(filenames);
     free(remapped_buf); 
