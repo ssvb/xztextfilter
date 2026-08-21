@@ -3,12 +3,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
-#include <math.h>
 #include <lzma.h>
 
 /**
  * ==============================================================================
- * ALGORITHM OVERVIEW: Multi-Target Simulated Annealing with Defragmentation
+ * ALGORITHM OVERVIEW: Chunk-Partitioned Greedy Local Search
  * ==============================================================================
  * 
  * 1. The Global Objective (Multi-File Optimization)
@@ -23,37 +22,32 @@
  *      coding (Markov chains) rather than finding long historical LZ matches.
  *    - lc (Literal Context): Configurable via '--lc=' (default: 3). 
  *      Determines how many of the highest bits of the PREVIOUS byte are used as 
- *      the context to select the probability model for encoding the CURRENT byte. 
- *    - lp (Literal Position): Configurable via '--lp=' (default: 0).
- *      Determines how many of the lowest bits of the byte's position are used 
- *      for literal encoding.
- *    - pb (Match Position): Configurable via '--pb=' (default: 2).
- *      Determines how many of the lowest bits of the byte's position are used 
- *      for match encoding. Default pb=2 aligns with standard LZMA file settings.
+ *      the context to select the probability model for encoding the CURRENT byte.
  * 
- * 3. Competing Entropy & Probabilistic Acceptance
- *    - Global improvements are accepted unconditionally.
- *    - Global regressions are accepted probabilistically: P = exp(-dE / T). 
- *    This allows the algorithm to escape local minima. The temperature T cools 
- *    linearly over the timeout period.
+ * 3. Chunk Partitioning and Strict Normalisation
+ *    Depending on the `lc` value, the 256-byte table is partitioned into 
+ *    pow(2, lc) equally sized chunks. To ensure search space structural consistency:
+ *    - Elements inside each chunk are always strictly ascending.
+ *    - The chunks themselves are sorted by the mathematical average (sum) of 
+ *      their internal elements.
+ *    - Chunk sorting ties are resolved by the value of the first element.
  * 
- * 4. Dual Mutation Strategy (Random Swap vs. Defragmentation)
- *    - Random Swap (75%): Swaps two entirely random indices in the mapping.
- *    - Defragmentation (25%): Picks an index 'i', targets the value one higher 
- *      than remap[i], finds where that target value is currently located ('j'), 
- *      and swaps remap[i+1] with remap[j]. This encourages creating contiguous, 
- *      ascending byte sequences, which greatly benefits LZMA's Markov chain 
- *      modeling when evaluating serialized data streams.
+ * 4. Exhaustive Mutation Strategy
+ *    - The algorithm picks 3 distinct chunks randomly (or 2 if lc=1).
+ *    - Inside each picked chunk, it picks 1 random element.
+ *    - It iterates through ALL possible permutations/swaps of those elements.
+ *    - After applying a permutation, it forcefully normalises the table mapping.
+ *    - It rapidly evaluates all valid permutations and greedily accepts ONLY the 
+ *      best swap if it strictly reduces the total compressed size. All non-improving
+ *      swaps are instantly discarded.
  * 
- * 5. State & Milestone Tracking & Formatting
+ * 5. State & Milestone Tracking
  *    The algorithm maintains distinct evaluation anchors to track progress:
- *    - Nonremapped (Baseline): Size under pure identity mapping.
- *    - Initial: Size evaluated using the provided seed_remap array.
- *    - Previous (Milestone): Size at the last recorded global best.
+ *    - Nonremapped: Size under pure identity mapping.
+ *    - Initial: Size evaluated using the provided (and normalised) seed_remap.
+ *    - Previous: Size at the last recorded global best.
  * ==============================================================================
  */
-
-#define INITIAL_TEMPERATURE 50.0
 
 /* 
  * REPLACE THIS BLOCK with the output from stderr to use the best mapping 
@@ -83,11 +77,11 @@ typedef struct {
     const char *filename;
     uint8_t *in_buf;
     size_t file_size;
-    size_t baseline_comp_size;  // Pure identity baseline ("Nonremapped")
-    size_t initial_comp_size;   // Seed remap ("Initial")
-    size_t current_comp_size;   // Evaluated size of the current working SA state
-    size_t milestone_comp_size; // Evaluated size at the last global best ("Previous")
-    size_t temp_comp_size;      // Evaluated size during a candidate mutation
+    size_t baseline_comp_size;  
+    size_t initial_comp_size;   
+    size_t current_comp_size;   
+    size_t milestone_comp_size; 
+    size_t temp_comp_size;      
 } FileData;
 
 void print_help(const char *prog_name) {
@@ -96,13 +90,10 @@ void print_help(const char *prog_name) {
     printf("  --help          Show this help message and exit.\n");
     printf("  --timeout=SEC   Set timeout in seconds (default: 600).\n");
     printf("  --dict=KB       Set LZMA dictionary size in kilobytes (default: 4).\n");
-    printf("  --lc=BITS       Set LZMA literal context bits (0-4, default: 3).\n");
+    printf("  --lc=BITS       Set LZMA literal context bits (1-4, default: 3).\n");
     printf("  --lp=BITS       Set LZMA literal position bits (0-4, default: 0).\n");
     printf("  --pb=BITS       Set LZMA position bits (0-4, default: 2).\n");
     printf("\n");
-    printf("Description:\n");
-    printf("  Optimizes byte mappings to minimize LZMA compressed size across provided files.\n");
-    printf("  Uses Simulated Annealing and continuously outputs the best mapping to stderr.\n");
 }
 
 // Function to evaluate the objective (compress buffer with tuned LZMA properties)
@@ -113,10 +104,8 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
         exit(EXIT_FAILURE);
     }
     
-    // LZMA requires a minimum dictionary size of 4096 bytes (4 KB).
     uint32_t dict_bytes = (uint32_t)dict_param_kb * 1024;
     opt.dict_size = (dict_bytes < LZMA_DICT_SIZE_MIN) ? LZMA_DICT_SIZE_MIN : dict_bytes; 
-    
     opt.lc = lc_param;                         
     opt.lp = lp_param;                         
     opt.pb = pb_param;                         
@@ -135,7 +124,60 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
     return (ret == LZMA_OK) ? out_pos : out_capacity + 1;
 }
 
-// Helper function to print bytes with space padding for alignment
+// Normalisation Sorting Comparators
+int cmp_uint8(const void *a, const void *b) {
+    return (*(const uint8_t *)a) - (*(const uint8_t *)b);
+}
+
+typedef struct {
+    int sum;
+    uint8_t first_val;
+    uint8_t data[256];
+} Chunk;
+
+int cmp_chunk(const void *a, const void *b) {
+    const Chunk *ca = (const Chunk *)a;
+    const Chunk *cb = (const Chunk *)b;
+    if (ca->sum < cb->sum) return -1;
+    if (ca->sum > cb->sum) return 1;
+    if (ca->first_val < cb->first_val) return -1;
+    if (ca->first_val > cb->first_val) return 1;
+    return 0;
+}
+
+// Strictly normalises the remap table based on chunk-based partitioning rules
+void normalize_remap(uint8_t *remap, int lc) {
+    int num_chunks = 1 << lc;
+    int chunk_size = 256 / num_chunks;
+    
+    Chunk chunks[16]; // lc is at most 4, so max 16 chunks
+    
+    for (int c = 0; c < num_chunks; c++) {
+        chunks[c].sum = 0;
+        for (int i = 0; i < chunk_size; i++) {
+            chunks[c].data[i] = remap[c * chunk_size + i];
+        }
+        // 1. Sort internal chunk data ascending
+        qsort(chunks[c].data, chunk_size, sizeof(uint8_t), cmp_uint8);
+        
+        // 2. Compute properties for chunk-level sorting
+        for (int i = 0; i < chunk_size; i++) {
+            chunks[c].sum += chunks[c].data[i];
+        }
+        chunks[c].first_val = chunks[c].data[0];
+    }
+    
+    // 3. Sort the chunks themselves
+    qsort(chunks, num_chunks, sizeof(Chunk), cmp_chunk);
+    
+    // 4. Write back to the remap array
+    for (int c = 0; c < num_chunks; c++) {
+        for (int i = 0; i < chunk_size; i++) {
+            remap[c * chunk_size + i] = chunks[c].data[i];
+        }
+    }
+}
+
 void print_byte_literal(FILE *out, uint8_t b) {
     if (b >= 32 && b <= 126) {
         if (b == '\'') {
@@ -150,7 +192,6 @@ void print_byte_literal(FILE *out, uint8_t b) {
     }
 }
 
-// Dumps the current best mapping exactly as a perfectly aligned C array
 void print_remap_table_as_source(const uint8_t *remap) {
     fprintf(stderr, "unsigned char seed_remap[256] = {\n    ");
     for (int i = 0; i < 256; i++) {
@@ -168,7 +209,7 @@ void print_remap_table_as_source(const uint8_t *remap) {
 
 int main(int argc, char **argv) {
     int timeout = 600; 
-    int dict_param_kb = 4; // Updated default for increased speed & entropy coding priority
+    int dict_param_kb = 4; 
     int lc_param = 3; 
     int lp_param = 0;
     int pb_param = 2;
@@ -183,8 +224,6 @@ int main(int argc, char **argv) {
             return EXIT_SUCCESS;
         } else if (strncmp(argv[i], "--timeout=", 10) == 0) {
             timeout = atoi(argv[i] + 10);
-        } else if (strncmp(argv[i], "--timout=", 9) == 0) { 
-            timeout = atoi(argv[i] + 9);
         } else if (strncmp(argv[i], "--dict=", 7) == 0) {
             dict_param_kb = atoi(argv[i] + 7);
         } else if (strncmp(argv[i], "--lc=", 5) == 0) {
@@ -205,6 +244,12 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    if (lc_param == 0) {
+        fprintf(stderr, "Error: lc=0 results in 1 chunk which is strictly sorted internally, effectively forcing a rigid identity mapping. Optimization is impossible. Please use lc >= 1.\n");
+        free(filenames);
+        return EXIT_FAILURE;
+    }
+
     FileData *files = malloc(file_count * sizeof(FileData));
     size_t max_file_size = 0;
     int max_filename_len = 0;
@@ -212,7 +257,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < file_count; i++) {
         files[i].filename = filenames[i];
         
-        // Calculate max filename length for perfect alignment in report
         int fn_len = (int)strlen(filenames[i]);
         if (fn_len > max_filename_len) {
             max_filename_len = fn_len;
@@ -228,9 +272,7 @@ int main(int argc, char **argv) {
         files[i].file_size = (size_t)ftell(f);
         fseek(f, 0, SEEK_SET);
 
-        if (files[i].file_size > max_file_size) {
-            max_file_size = files[i].file_size;
-        }
+        if (files[i].file_size > max_file_size) max_file_size = files[i].file_size;
 
         files[i].in_buf = malloc(files[i].file_size);
         if (fread(files[i].in_buf, 1, files[i].file_size, f) != files[i].file_size) {
@@ -254,13 +296,13 @@ int main(int argc, char **argv) {
         files[i].baseline_comp_size = s;
         baseline_sum += s;
     }
-    
     fprintf(stderr, "Original Identity Mapping Total Size: %zu bytes\n\n", baseline_sum);
 
     // 2. Evaluate User Seed ("Initial")
+    // Note: The user seed is evaluated exactly as provided, and then normalised to serve as the starting state.
     uint8_t current_remap[256];
     memcpy(current_remap, seed_remap, 256);
-
+    
     size_t initial_sum = 0;
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
@@ -268,18 +310,56 @@ int main(int argc, char **argv) {
         }
         size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
         files[i].initial_comp_size = s;
-        files[i].current_comp_size = s;
-        files[i].milestone_comp_size = s; // First "Previous" milestone is the Initial state
         initial_sum += s;
     }
     
-    size_t current_sum = initial_sum;
-    size_t best_sum = initial_sum;
-    fprintf(stderr, "Starting Seed Total Size: %zu bytes\n\n", best_sum);
+    // Normalise the seed array to ensure chunk constraints hold before iterating
+    normalize_remap(current_remap, lc_param);
+    
+    size_t current_sum = 0;
+    for (int i = 0; i < file_count; i++) {
+        for (size_t j = 0; j < files[i].file_size; j++) {
+            remapped_buf[j] = current_remap[files[i].in_buf[j]];
+        }
+        size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
+        files[i].current_comp_size = s;
+        files[i].milestone_comp_size = s; 
+        current_sum += s;
+    }
+    
+    size_t best_sum = current_sum;
+    fprintf(stderr, "Initial Seed Total Size (Pure): %zu bytes\n", initial_sum);
+    fprintf(stderr, "Initial Seed Total Size (Normalised): %zu bytes\n\n", current_sum);
 
     srand((unsigned int)time(NULL));
     time_t start_time = time(NULL);
     unsigned long long iterations = 0;
+
+    int num_chunks = 1 << lc_param;
+    int chunk_size = 256 / num_chunks;
+    
+    // Define the valid swap permutations (Excluding identity permutations)
+    int perms3[5][3] = {
+        {1, 0, 2}, // Swap Chunk A, B
+        {2, 1, 0}, // Swap Chunk A, C
+        {0, 2, 1}, // Swap Chunk B, C
+        {1, 2, 0}, // Rot Left
+        {2, 0, 1}  // Rot Right
+    };
+    const char *perms3_desc[5] = {
+        "2-way element swap (Chunks A <-> B)",
+        "2-way element swap (Chunks A <-> C)",
+        "2-way element swap (Chunks B <-> C)",
+        "3-way element rotation (A <- B <- C <- A)",
+        "3-way element rotation (A -> B -> C -> A)" 
+    };
+    
+    int perms2[1][2] = {
+        {1, 0}     // Swap Chunk A, B
+    };
+    const char *perms2_desc[1] = {
+        "2-way element swap (Chunks A <-> B)"
+    };
 
     // =========================================================
     // THE OPTIMIZATION LOOP
@@ -290,87 +370,106 @@ int main(int argc, char **argv) {
         if (elapsed >= timeout) break;
 
         iterations++;
-        double progress = elapsed / (double)timeout;
-        double temperature = INITIAL_TEMPERATURE * (1.0 - progress);
-        if (temperature < 0.001) temperature = 0.001; 
 
-        // 3. Mutation Phase (Choose between Random or Defragment)
-        int is_defrag = (rand() % 4 == 0); // 25% chance of defragmenting
-        int idx1, idx2;
-        const char *op_type;
+        // 3. Selection Phase: Pick distinct chunks
+        int c[3] = {-1, -1, -1};
+        int num_picks = (lc_param == 1) ? 2 : 3;
 
-        if (is_defrag) {
-            int i = rand() % 255; 
-            if (current_remap[i] == 0xFF) continue; 
-            
-            uint8_t target_val = current_remap[i] + 1;
-            int j = 0;
-            for (; j < 256; j++) {
-                if (current_remap[j] == target_val) break;
-            }
-            
-            idx1 = i + 1;
-            idx2 = j;
-            op_type = "defragment";
-            
-            if (idx1 == idx2) continue; 
-        } else {
-            idx1 = rand() % 256;
-            idx2 = rand() % 256;
-            if (idx1 == idx2) continue;
-            op_type = "random";
+        c[0] = rand() % num_chunks;
+        do { c[1] = rand() % num_chunks; } while(c[1] == c[0]);
+        if (num_picks == 3) {
+            do { c[2] = rand() % num_chunks; } while(c[2] == c[0] || c[2] == c[1]);
         }
 
-        // Apply Swap
-        uint8_t temp = current_remap[idx1];
-        current_remap[idx1] = current_remap[idx2];
-        current_remap[idx2] = temp;
-
-        // 4. Evaluation Phase
-        size_t new_sum = 0;
-        for (int i = 0; i < file_count; i++) {
-            for (size_t j = 0; j < files[i].file_size; j++) {
-                remapped_buf[j] = current_remap[files[i].in_buf[j]];
-            }
-            files[i].temp_comp_size = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
-            new_sum += files[i].temp_comp_size;
+        // Pick a random element inside each chunk
+        int idx[3];
+        uint8_t val[3];
+        for (int i = 0; i < num_picks; i++) {
+            int offset = rand() % chunk_size;
+            idx[i] = c[i] * chunk_size + offset;
+            val[i] = current_remap[idx[i]];
         }
 
-        // 5. Metropolis Acceptance Criterion
-        int accept = 0;
-        if (new_sum < current_sum) {
-            accept = 1; 
-        } else {
-            double diff = (double)(new_sum - current_sum);
-            double p_accept = exp(-diff / temperature);
-            double r = (double)rand() / RAND_MAX;
-            if (r < p_accept) {
-                accept = 1; 
+        // 4. Exhaustive Search over the Permutations
+        size_t best_local_sum = current_sum; // Must strictly improve upon the current best state
+        uint8_t best_local_remap[256];
+        size_t best_local_file_sizes[256]; // Need tracking for milestone reporting
+        const char *best_desc = NULL;
+        int found_improvement = 0;
+        
+        int num_perms = (num_picks == 3) ? 5 : 1;
+        
+        for (int p = 0; p < num_perms; p++) {
+            uint8_t test_remap[256];
+            memcpy(test_remap, current_remap, 256);
+            
+            // Apply the specific element swap permutation
+            if (num_picks == 3) {
+                test_remap[idx[0]] = val[perms3[p][0]];
+                test_remap[idx[1]] = val[perms3[p][1]];
+                test_remap[idx[2]] = val[perms3[p][2]];
+            } else {
+                test_remap[idx[0]] = val[perms2[p][0]];
+                test_remap[idx[1]] = val[perms2[p][1]];
             }
-        }
-
-        if (accept) {
-            // Apply temp state to current running state
-            current_sum = new_sum;
+            
+            // Re-apply sorting normalisation
+            normalize_remap(test_remap, lc_param);
+            
+            // Evaluate compressed sizes using an early-abort threshold logic
+            size_t test_sum = 0;
+            int aborted = 0;
+            size_t local_file_sizes[256]; // Assuming < 256 input files is safe
+            
             for (int i = 0; i < file_count; i++) {
-                files[i].current_comp_size = files[i].temp_comp_size;
+                for (size_t j = 0; j < files[i].file_size; j++) {
+                    remapped_buf[j] = test_remap[files[i].in_buf[j]];
+                }
+                
+                local_file_sizes[i] = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
+                test_sum += local_file_sizes[i];
+                
+                // If it's already worse than the best found in this iteration's permutations, stop evaluating
+                if (test_sum >= best_local_sum) {
+                    aborted = 1;
+                    break;
+                }
+            }
+            
+            // If the permutation strictly outperforms others tested this iteration
+            if (!aborted && test_sum < best_local_sum) {
+                best_local_sum = test_sum;
+                memcpy(best_local_remap, test_remap, 256);
+                best_desc = (num_picks == 3) ? perms3_desc[p] : perms2_desc[p];
+                found_improvement = 1;
+                for (int i = 0; i < file_count; i++) {
+                    best_local_file_sizes[i] = local_file_sizes[i];
+                }
+            }
+        }
+        
+        // 5. Greedy Application
+        if (found_improvement && best_local_sum < current_sum) {
+            current_sum = best_local_sum;
+            memcpy(current_remap, best_local_remap, 256);
+            for (int i = 0; i < file_count; i++) {
+                files[i].current_comp_size = best_local_file_sizes[i];
             }
             
             // Check against GLOBAL absolute minimum (Milestone)
-            if (new_sum < best_sum) {
+            if (current_sum < best_sum) {
                 
-                // Calculate total deltas
-                long long total_delta_base = (long long)new_sum - (long long)baseline_sum;
+                long long total_delta_base = (long long)current_sum - (long long)baseline_sum;
                 double total_pct_base = ((double)total_delta_base / (double)baseline_sum) * 100.0;
                 
-                long long total_delta_init = (long long)new_sum - (long long)initial_sum;
+                long long total_delta_init = (long long)current_sum - (long long)initial_sum;
                 double total_pct_init = ((double)total_delta_init / (double)initial_sum) * 100.0;
                 
-                long long total_delta_prev = (long long)new_sum - (long long)best_sum;
+                long long total_delta_prev = (long long)current_sum - (long long)best_sum;
                 double total_pct_prev = ((double)total_delta_prev / (double)best_sum) * 100.0;
 
-                fprintf(stderr, "/* NEW GLOBAL BEST: %zu bytes (Iter %llu, Temp %.2f, Op: %s, dict:%dK/lc:%d/lp:%d/pb:%d) */\n", 
-                        new_sum, iterations, temperature, op_type, dict_param_kb, lc_param, lp_param, pb_param);
+                fprintf(stderr, "/* NEW GLOBAL BEST: %zu bytes (Iter %llu, Elapsed: %.1fs, Op: %s, dict:%dK/lc:%d/lp:%d/pb:%d) */\n", 
+                        current_sum, iterations, elapsed, best_desc, dict_param_kb, lc_param, lp_param, pb_param);
                 
                 fprintf(stderr, "/* TOTAL IMPROVEMENT:\n");
                 fprintf(stderr, "      vs Nonremapped: %lld bytes (%+.2f%%)\n", total_delta_base, total_pct_base);
@@ -380,15 +479,15 @@ int main(int argc, char **argv) {
                 
                 fprintf(stderr, "/* FILE METRICS [vs Nonremapped]:\n");
                 for (int i = 0; i < file_count; i++) {
-                    long long delta = (long long)files[i].temp_comp_size - (long long)files[i].baseline_comp_size;
+                    long long delta = (long long)files[i].current_comp_size - (long long)files[i].baseline_comp_size;
                     double pct = ((double)delta / (double)files[i].baseline_comp_size) * 100.0;
                     fprintf(stderr, "   - %-*s : %10zu bytes (%+10lld B, %+7.2f%%)\n", 
-                            max_filename_len, files[i].filename, files[i].temp_comp_size, delta, pct);
+                            max_filename_len, files[i].filename, files[i].current_comp_size, delta, pct);
                 }
                 
                 fprintf(stderr, "   FILE METRICS [vs Initial]:\n");
                 for (int i = 0; i < file_count; i++) {
-                    long long delta = (long long)files[i].temp_comp_size - (long long)files[i].initial_comp_size;
+                    long long delta = (long long)files[i].current_comp_size - (long long)files[i].initial_comp_size;
                     double pct = ((double)delta / (double)files[i].initial_comp_size) * 100.0;
                     fprintf(stderr, "   - %-*s : %+10lld bytes (%+7.2f%%)\n", 
                             max_filename_len, files[i].filename, delta, pct);
@@ -396,24 +495,19 @@ int main(int argc, char **argv) {
                 
                 fprintf(stderr, "   FILE METRICS [vs Previous]:\n");
                 for (int i = 0; i < file_count; i++) {
-                    long long delta = (long long)files[i].temp_comp_size - (long long)files[i].milestone_comp_size;
+                    long long delta = (long long)files[i].current_comp_size - (long long)files[i].milestone_comp_size;
                     double pct = ((double)delta / (double)files[i].milestone_comp_size) * 100.0;
                     fprintf(stderr, "   - %-*s : %+10lld bytes (%+7.2f%%)\n", 
                             max_filename_len, files[i].filename, delta, pct);
                     
-                    // Lock in this file's state for the new sequential milestone
-                    files[i].milestone_comp_size = files[i].temp_comp_size;
+                    // Lock in this file's state for the next sequential milestone jump
+                    files[i].milestone_comp_size = files[i].current_comp_size;
                 }
                 fprintf(stderr, "*/\n");
                 
-                // Lock in the new global minimum
-                best_sum = new_sum;
+                best_sum = current_sum;
                 print_remap_table_as_source(current_remap);
             }
-        } else {
-            // Rejection: Undo swap
-            current_remap[idx2] = current_remap[idx1];
-            current_remap[idx1] = temp;
         }
     }
 
