@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <math.h>
 #include <lzma.h>
 
 /**
@@ -17,43 +18,34 @@
  * 
  * 2. Tunable LZMA Markov Chain Modeling
  *    - dict (Dictionary Size): Configurable via '--dict=' in KB (default: 4).
- *      Defaults to the 4KB minimum to drastically increase evaluation speed and 
- *      to force the objective function to rely heavily on the literal/entropy 
- *      coding (Markov chains) rather than finding long historical LZ matches.
+ *      Defaults to the 4KB minimum to drastically increase evaluation speed.
  *    - lc (Literal Context): Configurable via '--lc=' (default: 3). 
- *      Determines how many of the highest bits of the PREVIOUS byte are used as 
- *      the context to select the probability model for encoding the CURRENT byte.
  * 
  * 3. Chunk Partitioning and Strict Normalisation
  *    Depending on the `lc` value, the 256-byte table is partitioned into 
  *    pow(2, lc) equally sized chunks. To ensure search space structural consistency:
  *    - Elements inside each chunk are always strictly ascending.
- *    - The chunks themselves are sorted by the mathematical average (sum) of 
- *      their internal elements.
- *    - Chunk sorting ties are resolved by the value of the first element.
+ *    - The chunks themselves are sorted by the mathematical average (sum).
  * 
- * 4. Exhaustive Mutation Strategy
+ * 4. Progressive Heuristic Pre-Pass Partitioning
+ *    - Optional feature triggered by `--heuristic[=MAX_TESTS]`.
+ *    - Automatically starts by dividing chunks into M=2 subchunks.
+ *    - Exhaustively generates valid combinatorial unlabeled subsets.
+ *    - If an improvement over the identity mapping is found, it recursively
+ *      scales to M=4, M=8, etc., attempting finer structural permutations.
+ *    - Duplicate Rejection: When M >= 4, the algorithm mathematically detects
+ *      if a generated partition is structurally equivalent to one already tested 
+ *      in the M/2 pass (where all paired adjacent elements fall into the same bin)
+ *      and skips its evaluation to preserve testing allowance.
+ * 
+ * 5. Exhaustive Mutation Strategy
  *    - The algorithm picks 3 distinct chunks randomly (or 2 if lc=1).
  *    - Inside each picked chunk, it picks 1 random element.
- *    - It iterates through ALL possible permutations/swaps of those elements.
- *    - After applying a permutation, it forcefully normalises the table mapping.
- *    - It rapidly evaluates all valid permutations and greedily accepts ONLY the 
- *      best swap if it strictly reduces the total compressed size. All non-improving
- *      swaps are instantly discarded.
- * 
- * 5. State & Milestone Tracking
- *    The algorithm maintains distinct evaluation anchors to track progress:
- *    - Nonremapped: Size under pure identity mapping.
- *    - Initial: Size evaluated using the provided (and normalised) seed_remap.
- *    - Previous: Size at the last recorded global best.
+ *    - It rapidly evaluates all permutations of these elements and greedily applies
+ *      improvements.
  * ==============================================================================
  */
 
-/* 
- * REPLACE THIS BLOCK with the output from stderr to use the best mapping 
- * as the new seed for the next run. Initialized here to the Identity Mapping
- * using spaced character literals for perfect column alignment.
- */
 unsigned char seed_remap[256] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -84,19 +76,42 @@ typedef struct {
     size_t temp_comp_size;      
 } FileData;
 
+// Context purely to support the recursive heuristic combination generator
+typedef struct {
+    int M;
+    int C;
+    int S;
+    unsigned long long heur_tested;
+    unsigned long long heur_limit;
+    size_t best_heur_sum;
+    uint8_t best_heur_remap[256];
+    int file_count;
+    FileData *files;
+    uint8_t *remapped_buf;
+    uint8_t *out_buf;
+    size_t out_capacity;
+    int dict_param_kb;
+    int lc_param;
+    int lp_param;
+    int pb_param;
+    time_t start_time;
+    int timeout;
+} HeurContext;
+
 void print_help(const char *prog_name) {
     printf("Usage: %s [OPTIONS] <input_file_1> [input_file_2 ...]\n\n", prog_name);
     printf("Options:\n");
-    printf("  --help          Show this help message and exit.\n");
-    printf("  --timeout=SEC   Set timeout in seconds (default: 600).\n");
-    printf("  --dict=KB       Set LZMA dictionary size in kilobytes (default: 4).\n");
-    printf("  --lc=BITS       Set LZMA literal context bits (1-4, default: 3).\n");
-    printf("  --lp=BITS       Set LZMA literal position bits (0-4, default: 0).\n");
-    printf("  --pb=BITS       Set LZMA position bits (0-4, default: 2).\n");
+    printf("  --help            Show this help message and exit.\n");
+    printf("  --timeout=SEC     Set timeout in seconds (default: 600).\n");
+    printf("  --reshuffle       Randomize the initial remap table before starting.\n");
+    printf("  --heuristic[=N]   Run exhaustive subchunk scaling pre-pass (default N=128).\n");
+    printf("  --dict=KB         Set LZMA dictionary size in kilobytes (default: 4).\n");
+    printf("  --lc=BITS         Set LZMA literal context bits (1-4, default: 3).\n");
+    printf("  --lp=BITS         Set LZMA literal position bits (0-4, default: 0).\n");
+    printf("  --pb=BITS         Set LZMA position bits (0-4, default: 2).\n");
     printf("\n");
 }
 
-// Function to evaluate the objective (compress buffer with tuned LZMA properties)
 size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
     lzma_options_lzma opt;
     if (lzma_lzma_preset(&opt, 0)) {
@@ -124,7 +139,6 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
     return (ret == LZMA_OK) ? out_pos : out_capacity + 1;
 }
 
-// Normalisation Sorting Comparators
 int cmp_uint8(const void *a, const void *b) {
     return (*(const uint8_t *)a) - (*(const uint8_t *)b);
 }
@@ -145,36 +159,109 @@ int cmp_chunk(const void *a, const void *b) {
     return 0;
 }
 
-// Strictly normalises the remap table based on chunk-based partitioning rules
 void normalize_remap(uint8_t *remap, int lc) {
     int num_chunks = 1 << lc;
     int chunk_size = 256 / num_chunks;
     
-    Chunk chunks[16]; // lc is at most 4, so max 16 chunks
+    Chunk chunks[16]; 
     
     for (int c = 0; c < num_chunks; c++) {
         chunks[c].sum = 0;
         for (int i = 0; i < chunk_size; i++) {
             chunks[c].data[i] = remap[c * chunk_size + i];
         }
-        // 1. Sort internal chunk data ascending
         qsort(chunks[c].data, chunk_size, sizeof(uint8_t), cmp_uint8);
         
-        // 2. Compute properties for chunk-level sorting
         for (int i = 0; i < chunk_size; i++) {
             chunks[c].sum += chunks[c].data[i];
         }
         chunks[c].first_val = chunks[c].data[0];
     }
     
-    // 3. Sort the chunks themselves
     qsort(chunks, num_chunks, sizeof(Chunk), cmp_chunk);
     
-    // 4. Write back to the remap array
     for (int c = 0; c < num_chunks; c++) {
         for (int i = 0; i < chunk_size; i++) {
             remap[c * chunk_size + i] = chunks[c].data[i];
         }
+    }
+}
+
+// Backtracking algorithm generates unlabeled subsets, guaranteeing mathematically distinct subchunk partitions 
+void generate_partitions(int element_idx, int num_active_chunks, int *counts, int *assignment, HeurContext *ctx) {
+    if (ctx->heur_tested >= ctx->heur_limit) return;
+    time_t now = time(NULL);
+    if (difftime(now, ctx->start_time) >= ctx->timeout) return;
+    
+    if (element_idx == ctx->C * ctx->M) {
+        
+        // Mathematical duplicate rejection:
+        // A partition at step M >= 4 is logically identical to a partition evaluated
+        // in the M/2 pass if every adjacent pair of subchunks falls into the same bin.
+        if (ctx->M > 2) {
+            int is_duplicate = 1;
+            for (int i = 0; i < ctx->C * ctx->M; i += 2) {
+                if (assignment[i] != assignment[i + 1]) {
+                    is_duplicate = 0;
+                    break;
+                }
+            }
+            if (is_duplicate) return; 
+        }
+
+        uint8_t heur_remap[256];
+        int fill[16] = {0};
+        
+        // Assemble subchunks mapped to their physical representation based on the partition logic
+        for (int i = 0; i < ctx->C * ctx->M; i++) {
+            int c = assignment[i];
+            int offset = fill[c] * ctx->S;
+            for (int j = 0; j < ctx->S; j++) {
+                heur_remap[c * (ctx->M * ctx->S) + offset + j] = i * ctx->S + j; 
+            }
+            fill[c]++;
+        }
+        
+        normalize_remap(heur_remap, ctx->lc_param);
+        
+        size_t test_sum = 0;
+        int aborted = 0;
+        for (int i = 0; i < ctx->file_count; i++) {
+            for (size_t j = 0; j < ctx->files[i].file_size; j++) {
+                ctx->remapped_buf[j] = heur_remap[ctx->files[i].in_buf[j]];
+            }
+            size_t s = compress_buffer(ctx->remapped_buf, ctx->files[i].file_size, ctx->out_buf, ctx->out_capacity, ctx->dict_param_kb, ctx->lc_param, ctx->lp_param, ctx->pb_param);
+            test_sum += s;
+            if (test_sum >= ctx->best_heur_sum) {
+                aborted = 1;
+                break;
+            }
+        }
+        
+        if (!aborted && test_sum < ctx->best_heur_sum) {
+            ctx->best_heur_sum = test_sum;
+            memcpy(ctx->best_heur_remap, heur_remap, 256);
+        }
+        ctx->heur_tested++;
+        return;
+    }
+    
+    // Assign to existing unlabelled bin if it has capacity
+    for (int c = 0; c < num_active_chunks; c++) {
+        if (counts[c] < ctx->M) {
+            counts[c]++;
+            assignment[element_idx] = c;
+            generate_partitions(element_idx + 1, num_active_chunks, counts, assignment, ctx);
+            counts[c]--;
+            if (ctx->heur_tested >= ctx->heur_limit) return;
+        }
+    }
+    // Allocate to a completely new bin
+    if (num_active_chunks < ctx->C) {
+        counts[num_active_chunks]++;
+        assignment[element_idx] = num_active_chunks;
+        generate_partitions(element_idx + 1, num_active_chunks + 1, counts, assignment, ctx);
+        counts[num_active_chunks]--;
     }
 }
 
@@ -213,6 +300,10 @@ int main(int argc, char **argv) {
     int lc_param = 3; 
     int lp_param = 0;
     int pb_param = 2;
+    int do_reshuffle = 0;
+    
+    int do_heuristic = 0;
+    int heur_limit = 128;
     
     const char **filenames = malloc(argc * sizeof(char*));
     int file_count = 0;
@@ -224,6 +315,13 @@ int main(int argc, char **argv) {
             return EXIT_SUCCESS;
         } else if (strncmp(argv[i], "--timeout=", 10) == 0) {
             timeout = atoi(argv[i] + 10);
+        } else if (strcmp(argv[i], "--reshuffle") == 0) {
+            do_reshuffle = 1;
+        } else if (strcmp(argv[i], "--heuristic") == 0) {
+            do_heuristic = 1;
+        } else if (strncmp(argv[i], "--heuristic=", 12) == 0) {
+            do_heuristic = 1;
+            heur_limit = atoi(argv[i] + 12);
         } else if (strncmp(argv[i], "--dict=", 7) == 0) {
             dict_param_kb = atoi(argv[i] + 7);
         } else if (strncmp(argv[i], "--lc=", 5) == 0) {
@@ -245,10 +343,12 @@ int main(int argc, char **argv) {
     }
 
     if (lc_param == 0) {
-        fprintf(stderr, "Error: lc=0 results in 1 chunk which is strictly sorted internally, effectively forcing a rigid identity mapping. Optimization is impossible. Please use lc >= 1.\n");
+        fprintf(stderr, "Error: lc=0 results in 1 chunk effectively forcing a rigid identity mapping.\n");
         free(filenames);
         return EXIT_FAILURE;
     }
+
+    srand((unsigned int)time(NULL));
 
     FileData *files = malloc(file_count * sizeof(FileData));
     size_t max_file_size = 0;
@@ -298,11 +398,75 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Original Identity Mapping Total Size: %zu bytes\n\n", baseline_sum);
 
-    // 2. Evaluate User Seed ("Initial")
-    // Note: The user seed is evaluated exactly as provided, and then normalised to serve as the starting state.
+    time_t start_time = time(NULL);
+
     uint8_t current_remap[256];
     memcpy(current_remap, seed_remap, 256);
-    
+
+    // 2. Pre-Configuration Branch (Heuristic, Reshuffle, or Base Seed)
+    if (do_heuristic) {
+        int C = 1 << lc_param;
+        
+        fprintf(stderr, "Heuristic Pre-pass Enabled:\n");
+        fprintf(stderr, "  Total chunks (C):        %d\n", C);
+        fprintf(stderr, "  Testing limit:           %d arrangements\n\n", heur_limit);
+        
+        HeurContext ctx;
+        ctx.C = C;
+        ctx.heur_tested = 0;
+        ctx.heur_limit = heur_limit;
+        ctx.best_heur_sum = baseline_sum; // Start against true identity
+        for (int i = 0; i < 256; i++) ctx.best_heur_remap[i] = i; 
+        
+        ctx.file_count = file_count;
+        ctx.files = files;
+        ctx.remapped_buf = remapped_buf;
+        ctx.out_buf = out_buf;
+        ctx.out_capacity = out_capacity;
+        ctx.dict_param_kb = dict_param_kb;
+        ctx.lc_param = lc_param;
+        ctx.lp_param = lp_param;
+        ctx.pb_param = pb_param;
+        ctx.start_time = start_time;
+        ctx.timeout = timeout;
+        
+        int M = 2;
+        while (M * C <= 256 && ctx.heur_tested < ctx.heur_limit) {
+            ctx.M = M;
+            ctx.S = 256 / (C * M);
+            fprintf(stderr, "  Trying M=%d (Subchunk size: %d bytes)...\n", M, ctx.S);
+            
+            int counts[16] = {0};
+            int assignment[256] = {0};
+            
+            size_t before_m_sum = ctx.best_heur_sum;
+            
+            generate_partitions(0, 0, counts, assignment, &ctx);
+            
+            // Progressive Scaling: Continue searching finer granularities if improvement occurs
+            if (ctx.best_heur_sum < before_m_sum) {
+                fprintf(stderr, "    -> Improved compression to %zu bytes.\n", ctx.best_heur_sum);
+                M *= 2;
+            } else {
+                fprintf(stderr, "    -> No improvement found at M=%d. Stopping heuristic scale-up.\n", M);
+                break;
+            }
+        }
+        
+        memcpy(current_remap, ctx.best_heur_remap, 256);
+        fprintf(stderr, "\nHeuristic Pre-pass Finished. Seed replaced by Best Heuristic (tested %llu)\n\n", ctx.heur_tested);
+
+    } else if (do_reshuffle) {
+        // Fisher-Yates uniform shuffle
+        for (int i = 255; i > 0; i--) {
+            int j = rand() % (i + 1);
+            uint8_t temp = current_remap[i];
+            current_remap[i] = current_remap[j];
+            current_remap[j] = temp;
+        }
+    }
+
+    // Evaluate the resulting start-point configuration unconditionally 
     size_t initial_sum = 0;
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
@@ -313,7 +477,6 @@ int main(int argc, char **argv) {
         initial_sum += s;
     }
     
-    // Normalise the seed array to ensure chunk constraints hold before iterating
     normalize_remap(current_remap, lc_param);
     
     size_t current_sum = 0;
@@ -328,38 +491,28 @@ int main(int argc, char **argv) {
     }
     
     size_t best_sum = current_sum;
-    fprintf(stderr, "Initial Seed Total Size (Pure): %zu bytes\n", initial_sum);
-    fprintf(stderr, "Initial Seed Total Size (Normalised): %zu bytes\n\n", current_sum);
+    if (do_heuristic) {
+        fprintf(stderr, "Initial Seed Total Size (Heuristic & Normalised): %zu bytes\n\n", current_sum);
+    } else if (do_reshuffle) {
+        fprintf(stderr, "Initial Seed Total Size (Randomised & Normalised): %zu bytes\n\n", current_sum);
+    } else {
+        fprintf(stderr, "Initial Seed Total Size (Pure): %zu bytes\n", initial_sum);
+        fprintf(stderr, "Initial Seed Total Size (Normalised): %zu bytes\n\n", current_sum);
+    }
 
-    srand((unsigned int)time(NULL));
-    time_t start_time = time(NULL);
     unsigned long long iterations = 0;
-
     int num_chunks = 1 << lc_param;
     int chunk_size = 256 / num_chunks;
     
-    // Define the valid swap permutations (Excluding identity permutations)
-    int perms3[5][3] = {
-        {1, 0, 2}, // Swap Chunk A, B
-        {2, 1, 0}, // Swap Chunk A, C
-        {0, 2, 1}, // Swap Chunk B, C
-        {1, 2, 0}, // Rot Left
-        {2, 0, 1}  // Rot Right
-    };
+    int perms3[5][3] = { {1, 0, 2}, {2, 1, 0}, {0, 2, 1}, {1, 2, 0}, {2, 0, 1} };
     const char *perms3_desc[5] = {
-        "2-way element swap (Chunks A <-> B)",
-        "2-way element swap (Chunks A <-> C)",
-        "2-way element swap (Chunks B <-> C)",
-        "3-way element rotation (A <- B <- C <- A)",
+        "2-way element swap (Chunks A <-> B)", "2-way element swap (Chunks A <-> C)",
+        "2-way element swap (Chunks B <-> C)", "3-way element rotation (A <- B <- C <- A)",
         "3-way element rotation (A -> B -> C -> A)" 
     };
     
-    int perms2[1][2] = {
-        {1, 0}     // Swap Chunk A, B
-    };
-    const char *perms2_desc[1] = {
-        "2-way element swap (Chunks A <-> B)"
-    };
+    int perms2[1][2] = { {1, 0} };
+    const char *perms2_desc[1] = { "2-way element swap (Chunks A <-> B)" };
 
     // =========================================================
     // THE OPTIMIZATION LOOP
@@ -371,7 +524,7 @@ int main(int argc, char **argv) {
 
         iterations++;
 
-        // 3. Selection Phase: Pick distinct chunks
+        // 3. Selection Phase
         int c[3] = {-1, -1, -1};
         int num_picks = (lc_param == 1) ? 2 : 3;
 
@@ -381,7 +534,6 @@ int main(int argc, char **argv) {
             do { c[2] = rand() % num_chunks; } while(c[2] == c[0] || c[2] == c[1]);
         }
 
-        // Pick a random element inside each chunk
         int idx[3];
         uint8_t val[3];
         for (int i = 0; i < num_picks; i++) {
@@ -390,10 +542,10 @@ int main(int argc, char **argv) {
             val[i] = current_remap[idx[i]];
         }
 
-        // 4. Exhaustive Search over the Permutations
-        size_t best_local_sum = current_sum; // Must strictly improve upon the current best state
+        // 4. Exhaustive Search over Valid Permutations
+        size_t best_local_sum = current_sum; 
         uint8_t best_local_remap[256];
-        size_t best_local_file_sizes[256]; // Need tracking for milestone reporting
+        size_t best_local_file_sizes[256]; 
         const char *best_desc = NULL;
         int found_improvement = 0;
         
@@ -403,7 +555,6 @@ int main(int argc, char **argv) {
             uint8_t test_remap[256];
             memcpy(test_remap, current_remap, 256);
             
-            // Apply the specific element swap permutation
             if (num_picks == 3) {
                 test_remap[idx[0]] = val[perms3[p][0]];
                 test_remap[idx[1]] = val[perms3[p][1]];
@@ -413,13 +564,11 @@ int main(int argc, char **argv) {
                 test_remap[idx[1]] = val[perms2[p][1]];
             }
             
-            // Re-apply sorting normalisation
             normalize_remap(test_remap, lc_param);
             
-            // Evaluate compressed sizes using an early-abort threshold logic
             size_t test_sum = 0;
             int aborted = 0;
-            size_t local_file_sizes[256]; // Assuming < 256 input files is safe
+            size_t local_file_sizes[256]; 
             
             for (int i = 0; i < file_count; i++) {
                 for (size_t j = 0; j < files[i].file_size; j++) {
@@ -429,14 +578,12 @@ int main(int argc, char **argv) {
                 local_file_sizes[i] = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
                 test_sum += local_file_sizes[i];
                 
-                // If it's already worse than the best found in this iteration's permutations, stop evaluating
                 if (test_sum >= best_local_sum) {
                     aborted = 1;
                     break;
                 }
             }
             
-            // If the permutation strictly outperforms others tested this iteration
             if (!aborted && test_sum < best_local_sum) {
                 best_local_sum = test_sum;
                 memcpy(best_local_remap, test_remap, 256);
@@ -456,9 +603,7 @@ int main(int argc, char **argv) {
                 files[i].current_comp_size = best_local_file_sizes[i];
             }
             
-            // Check against GLOBAL absolute minimum (Milestone)
             if (current_sum < best_sum) {
-                
                 long long total_delta_base = (long long)current_sum - (long long)baseline_sum;
                 double total_pct_base = ((double)total_delta_base / (double)baseline_sum) * 100.0;
                 
@@ -500,7 +645,6 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "   - %-*s : %+10lld bytes (%+7.2f%%)\n", 
                             max_filename_len, files[i].filename, delta, pct);
                     
-                    // Lock in this file's state for the next sequential milestone jump
                     files[i].milestone_comp_size = files[i].current_comp_size;
                 }
                 fprintf(stderr, "*/\n");
@@ -513,10 +657,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "/* Search finished. Iterations: %llu. Final Best Sum: %zu bytes */\n", iterations, best_sum);
 
-    // Cleanup
-    for (int i = 0; i < file_count; i++) {
-        free(files[i].in_buf);
-    }
+    for (int i = 0; i < file_count; i++) free(files[i].in_buf);
     free(files);
     free(filenames);
     free(remapped_buf); 
