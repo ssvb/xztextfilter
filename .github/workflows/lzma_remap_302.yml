@@ -1,4 +1,4 @@
-name: LZMA Stochastic Optimization
+name: LZMA Stochastic Optimization 302
 
 on:
   push:
@@ -27,4 +27,4 @@ jobs:
           # The C program takes the timeout in seconds.
           # 5 hours = 18000 seconds. Setting to 17900 to ensure graceful C exit
           # before the GitHub Actions runner forcibly terminates the container.
-          ./lzma_remap_sa_multi --lc=3 --lp=0 --pb=2 --heuristic=256 --timeout=17900 /usr/bin/sed /usr/include/math.h bash.mo pg68283.txt pg2701.txt
+          ./lzma_remap_sa_multi --lc=3 --lp=0 --pb=2 --reshuffle --timeout=17900 /usr/bin/sed /usr/include/math.h bash.mo pg68283.txt pg2701.txt
