@@ -16,7 +16,7 @@
  *    input files. This guides the search toward a universal byte permutation 
  *    that minimizes entropy across the entire dataset.
  * 
- * 2. Tunable LZMA Markov Chain Modeling
+ * 2. Tunable LZMA Markov Chain Modeling (Fast Search Phase)
  *    - dict (Dictionary Size): Configurable via '--dict=' in KB (default: 4).
  *      Defaults to the 4KB minimum to drastically increase evaluation speed.
  *    - lc (Literal Context): Configurable via '--lc=' (default: 3). 
@@ -28,21 +28,31 @@
  *    - The chunks themselves are sorted by the mathematical average (sum).
  * 
  * 4. Progressive Heuristic Pre-Pass Partitioning
- *    - Optional feature triggered by `--heuristic[=MAX_TESTS]`.
+ *    - Optional feature triggered by '--heuristic[=MAX_TESTS]'.
  *    - Automatically starts by dividing chunks into M=2 subchunks.
  *    - Exhaustively generates valid combinatorial unlabeled subsets.
  *    - If an improvement over the identity mapping is found, it recursively
  *      scales to M=4, M=8, etc., attempting finer structural permutations.
  *    - Duplicate Rejection: When M >= 4, the algorithm mathematically detects
  *      if a generated partition is structurally equivalent to one already tested 
- *      in the M/2 pass (where all paired adjacent elements fall into the same bin)
- *      and skips its evaluation to preserve testing allowance.
+ *      in the M/2 pass and skips its evaluation to preserve testing allowance.
  * 
  * 5. Exhaustive Mutation Strategy
  *    - The algorithm picks 3 distinct chunks randomly (or 2 if lc=1).
  *    - Inside each picked chunk, it picks 1 random element.
  *    - It rapidly evaluates all permutations of these elements and greedily applies
  *      improvements.
+ * 
+ * 6. Final Evaluation Phase (Extreme Compression Check)
+ *    - Upon timeout, the algorithm evaluates three core mappings:
+ *        A. Identity Remap (Baseline)
+ *        B. Initial Seed (After Heuristic Pre-pass / Reshuffle)
+ *        C. Final Optimized Table
+ *    - To test true data entropy improvements, these are checked against LZMA2 
+ *      Preset 7 combined with the LZMA_PRESET_EXTREME flag (equivalent to xz -7e).
+ *      This ensures an 8MB dictionary, max nice_len (273), and heavy match-finding.
+ *    - Custom lc/lp/pb command-line overrides are enforced over the preset to 
+ *      guarantee consistent modeling logic.
  * ==============================================================================
  */
 
@@ -124,6 +134,43 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
     opt.lc = lc_param;                         
     opt.lp = lp_param;                         
     opt.pb = pb_param;                         
+
+    lzma_filter filters[2] = {
+        { .id = LZMA_FILTER_LZMA2, .options = &opt },
+        { .id = LZMA_VLI_UNKNOWN, .options = NULL }
+    };
+
+    size_t out_pos = 0;
+    lzma_ret ret = lzma_stream_buffer_encode(
+        filters, LZMA_CHECK_CRC32, NULL, 
+        in_buf, in_len, out_buf, &out_pos, out_capacity
+    );
+
+    return (ret == LZMA_OK) ? out_pos : out_capacity + 1;
+}
+
+/**
+ * Executes a high-depth compression test equivalent to `xz -7e`.
+ * Preset 7 naturally requests an 8MB dictionary. The LZMA_PRESET_EXTREME 
+ * bitmask maximizes nice_len and applies a deeper search strategy.
+ * 
+ * Command-line values for lc, lp, and pb explicitly override the preset 
+ * defaults to honor strict Markov chain configurations.
+ */
+size_t compress_buffer_extreme(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, int lc_param, int lp_param, int pb_param) {
+    lzma_options_lzma opt;
+    if (lzma_lzma_preset(&opt, 7 | LZMA_PRESET_EXTREME)) {
+        fprintf(stderr, "Error: Failed to set extreme LZMA preset.\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Explicitly lock to 8MB in case the underlying preset 7 dictates otherwise in specific liblzma builds
+    opt.dict_size = 8 * 1024 * 1024; 
+    
+    // Override with user-provided chain parameters
+    opt.lc = lc_param;
+    opt.lp = lp_param;
+    opt.pb = pb_param;
 
     lzma_filter filters[2] = {
         { .id = LZMA_FILTER_LZMA2, .options = &opt },
@@ -342,8 +389,19 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    if (lc_param == 0) {
-        fprintf(stderr, "Error: lc=0 results in 1 chunk effectively forcing a rigid identity mapping.\n");
+    // Bounds checking to prevent logical errors and severe buffer overflows on hardcoded arrays
+    if (lc_param < 1 || lc_param > 4) {
+        fprintf(stderr, "Error: --lc must be between 1 and 4 (maximum of 16 chunks).\n");
+        free(filenames);
+        return EXIT_FAILURE;
+    }
+    if (lp_param < 0 || lp_param > 4) {
+        fprintf(stderr, "Error: --lp must be between 0 and 4.\n");
+        free(filenames);
+        return EXIT_FAILURE;
+    }
+    if (pb_param < 0 || pb_param > 4) {
+        fprintf(stderr, "Error: --pb must be between 0 and 4.\n");
         free(filenames);
         return EXIT_FAILURE;
     }
@@ -374,23 +432,27 @@ int main(int argc, char **argv) {
 
         if (files[i].file_size > max_file_size) max_file_size = files[i].file_size;
 
-        files[i].in_buf = malloc(files[i].file_size);
-        if (fread(files[i].in_buf, 1, files[i].file_size, f) != files[i].file_size) {
+        // Ensure 1 byte minimum allocation to prevent crashes on completely empty files
+        files[i].in_buf = malloc(files[i].file_size > 0 ? files[i].file_size : 1);
+        if (files[i].file_size > 0 && fread(files[i].in_buf, 1, files[i].file_size, f) != files[i].file_size) {
             fprintf(stderr, "Error reading %s\n", filenames[i]);
             return EXIT_FAILURE;
         }
         fclose(f);
     }
 
-    uint8_t *remapped_buf = malloc(max_file_size);
+    uint8_t *remapped_buf = malloc(max_file_size > 0 ? max_file_size : 1);
     size_t out_capacity = lzma_stream_buffer_bound(max_file_size);
-    uint8_t *out_buf = malloc(out_capacity);
+    uint8_t *out_buf = malloc(out_capacity > 0 ? out_capacity : 1);
 
     // 1. Evaluate True Baseline ("Nonremapped" / Identity Mapping)
     size_t baseline_sum = 0;
+    uint8_t identity_remap[256];
+    for (int i = 0; i < 256; i++) identity_remap[i] = i;
+
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
-            remapped_buf[j] = files[i].in_buf[j];
+            remapped_buf[j] = identity_remap[files[i].in_buf[j]];
         }
         size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
         files[i].baseline_comp_size = s;
@@ -466,31 +528,39 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Evaluate the resulting start-point configuration unconditionally 
+    // Evaluate the resulting start-point configuration unconditionally purely for printing purposes
     size_t initial_sum = 0;
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
             remapped_buf[j] = current_remap[files[i].in_buf[j]];
         }
         size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
-        files[i].initial_comp_size = s;
         initial_sum += s;
     }
     
+    // Normalization enforces strict element ascension and chunk alignment based on means
     normalize_remap(current_remap, lc_param);
     
+    // Save the finalized "Initial Seed" before main search begins for the final extreme evaluation block
+    uint8_t loop_start_remap[256];
+    memcpy(loop_start_remap, current_remap, 256);
+
+    // Evaluate the normalized start-point configuration to act as the core search baseline 
     size_t current_sum = 0;
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
             remapped_buf[j] = current_remap[files[i].in_buf[j]];
         }
         size_t s = compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
+        files[i].initial_comp_size = s;
         files[i].current_comp_size = s;
         files[i].milestone_comp_size = s; 
         current_sum += s;
     }
     
+    size_t global_initial_sum = current_sum; 
     size_t best_sum = current_sum;
+
     if (do_heuristic) {
         fprintf(stderr, "Initial Seed Total Size (Heuristic & Normalised): %zu bytes\n\n", current_sum);
     } else if (do_reshuffle) {
@@ -607,8 +677,8 @@ int main(int argc, char **argv) {
                 long long total_delta_base = (long long)current_sum - (long long)baseline_sum;
                 double total_pct_base = ((double)total_delta_base / (double)baseline_sum) * 100.0;
                 
-                long long total_delta_init = (long long)current_sum - (long long)initial_sum;
-                double total_pct_init = ((double)total_delta_init / (double)initial_sum) * 100.0;
+                long long total_delta_init = (long long)current_sum - (long long)global_initial_sum; 
+                double total_pct_init = ((double)total_delta_init / (double)global_initial_sum) * 100.0;
                 
                 long long total_delta_prev = (long long)current_sum - (long long)best_sum;
                 double total_pct_prev = ((double)total_delta_prev / (double)best_sum) * 100.0;
@@ -655,7 +725,75 @@ int main(int argc, char **argv) {
         }
     }
 
-    fprintf(stderr, "/* Search finished. Iterations: %llu. Final Best Sum: %zu bytes */\n", iterations, best_sum);
+    fprintf(stderr, "\n/* Search finished. Iterations: %llu. Fast Mode Final Best Sum: %zu bytes */\n\n", iterations, best_sum);
+
+    // =========================================================
+    // 6. FINAL EXTREME COMPRESSION EVALUATION
+    // =========================================================
+    // Computes layout dimensions dynamically to ensure strict structural alignment
+    // when interpreting the stderr output purely as text blocks rather than HTML tables.
+    fprintf(stderr, "### Final Extreme Compression Evaluation (8MB Dict, Extreme Match Finder)\n\n");
+    
+    int w_file = max_filename_len < 4 ? 4 : max_filename_len;
+    int w_id = 16;
+    int w_seed = 20;
+    int w_final = 19;
+    int w_sav_id = 21;
+    int w_sav_sd = 17;
+
+    // Table Header Construction
+    fprintf(stderr, "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n",
+            w_file, "File", w_id, "Identity (Bytes)", w_seed, "Initial Seed (Bytes)", 
+            w_final, "Final Remap (Bytes)", w_sav_id, "Savings (vs Identity)", w_sav_sd, "Savings (vs Seed)");
+
+    // Strict Markdown Separator Padding
+    fprintf(stderr, "|-"); for(int k = 0; k < w_file; k++) fputc('-', stderr);
+    fprintf(stderr, "-|-"); for(int k = 0; k < w_id; k++) fputc('-', stderr);
+    fprintf(stderr, "-|-"); for(int k = 0; k < w_seed; k++) fputc('-', stderr);
+    fprintf(stderr, "-|-"); for(int k = 0; k < w_final; k++) fputc('-', stderr);
+    fprintf(stderr, "-|-"); for(int k = 0; k < w_sav_id; k++) fputc('-', stderr);
+    fprintf(stderr, "-|-"); for(int k = 0; k < w_sav_sd; k++) fputc('-', stderr);
+    fprintf(stderr, "-|\n");
+
+    for (int i = 0; i < file_count; i++) {
+        size_t id_size = 0, seed_size = 0, final_size = 0;
+
+        // A. Identity Evaluation
+        for (size_t j = 0; j < files[i].file_size; j++) {
+            remapped_buf[j] = identity_remap[files[i].in_buf[j]];
+        }
+        id_size = compress_buffer_extreme(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param, lp_param, pb_param);
+
+        // B. Initial Seed Evaluation
+        for (size_t j = 0; j < files[i].file_size; j++) {
+            remapped_buf[j] = loop_start_remap[files[i].in_buf[j]];
+        }
+        seed_size = compress_buffer_extreme(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param, lp_param, pb_param);
+
+        // C. Final Best Evaluation
+        for (size_t j = 0; j < files[i].file_size; j++) {
+            remapped_buf[j] = current_remap[files[i].in_buf[j]];
+        }
+        final_size = compress_buffer_extreme(remapped_buf, files[i].file_size, out_buf, out_capacity, lc_param, lp_param, pb_param);
+
+        // Calculate deltas mapping negative percentages to show shrinkage 
+        double pct_id = id_size ? ((double)((long long)final_size - (long long)id_size) / (double)id_size) * 100.0 : 0.0;
+        double pct_seed = seed_size ? ((double)((long long)final_size - (long long)seed_size) / (double)seed_size) * 100.0 : 0.0;
+
+        // Binds percentages to character arrays strictly for alignment inside dynamic columns 
+        char sav_id_str[32], sav_sd_str[32];
+        snprintf(sav_id_str, sizeof(sav_id_str), "%+.2f%%", pct_id);
+        snprintf(sav_sd_str, sizeof(sav_sd_str), "%+.2f%%", pct_seed);
+
+        fprintf(stderr, "| %-*s | %*zu | %*zu | %*zu | %*s | %*s |\n", 
+                w_file, files[i].filename, 
+                w_id, id_size, 
+                w_seed, seed_size, 
+                w_final, final_size, 
+                w_sav_id, sav_id_str, 
+                w_sav_sd, sav_sd_str);
+    }
+    fprintf(stderr, "\n");
 
     for (int i = 0; i < file_count; i++) free(files[i].in_buf);
     free(files);
