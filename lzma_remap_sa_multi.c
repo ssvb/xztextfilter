@@ -24,7 +24,7 @@
  *    - Crucial Constraint: Swaps are only valid if the elements belong to 
  *      different chunks. This preserves intra-chunk entropy while optimizing 
  *      inter-chunk mappings.
- *    - If no improvement is found after K (default: 100) iterations, the search 
+ *    - If no improvement is found after K (default: 1000) iterations, the search 
  *      space is narrowed by halving N. This mimics simulated annealing.
  * 
  * 4. Exhaustive "Thorough" Fallback and Candidate Archiving
@@ -37,8 +37,10 @@
  *      reshuffle) and begins a completely new optimization path.
  * 
  * 5. Detailed Metric Reporting & Final Evaluation
- *    - Inter-iteration reports detail per-file delta percentages compared to 
- *      the Identity map, the Initial seed map, and the Previous step map.
+ *    - Inter-iteration reports detail per-file and total aggregate delta 
+ *      percentages compared to the Identity map, the Initial seed map, and 
+ *      the Previous step map. It also exposes the active LZMA settings and 
+ *      candidate count.
  *    - Final Evaluation runs an absolute data entropy check via LZMA2 Preset 7 
  *      (Extreme) on all discovered result candidates.
  * ==============================================================================
@@ -95,7 +97,7 @@ void print_help(const char *prog_name) {
     printf("  --reshuffle       Randomize the initial remap table before starting.\n");
     printf("  --heuristic[=N]   Run exhaustive subchunk scaling pre-pass (default N=128).\n");
     printf("  --swaps=N         Initial number of simultaneous pair swaps (default: 128).\n");
-    printf("  --stagnation=K    Iterations without improvement before halving swaps (default: 100).\n");
+    printf("  --stagnation=K    Iterations without improvement before halving swaps (default: 1000).\n");
     printf("  --dict=KB         Set LZMA dictionary size in kilobytes (default: 4).\n");
     printf("  --lc=BITS         Set LZMA literal context bits (1-4, default: 3).\n");
     printf("  --lp=BITS         Set LZMA literal position bits (0-4, default: 0).\n");
@@ -174,15 +176,22 @@ void print_remap_table_as_source(const uint8_t *remap) {
 
 void print_detailed_report(int file_count, FileData *files, size_t *new_sizes, 
                            unsigned long long iter, double elapsed, int swaps, 
-                           const char* mode_name, int is_global_best) {
-    size_t total_new = 0;
-    for (int i = 0; i < file_count; i++) total_new += new_sizes[i];
+                           const char* mode_name, int is_global_best,
+                           int lc, int lp, int pb, int num_candidates) {
+    size_t total_baseline = 0, total_initial = 0, total_prev = 0, total_new = 0;
+    
+    for (int i = 0; i < file_count; i++) {
+        total_baseline += files[i].baseline_comp_size;
+        total_initial += files[i].initial_comp_size;
+        total_prev += files[i].current_comp_size;
+        total_new += new_sizes[i];
+    }
     
     fprintf(stderr, "\n/* %s: %zu bytes (Iter %llu, %.1fs, %s", 
             is_global_best ? "NEW GLOBAL BEST" : "Local Improvement", 
             total_new, iter, elapsed, mode_name);
     if (swaps > 0) fprintf(stderr, ", %d swaps", swaps);
-    fprintf(stderr, ") */\n");
+    fprintf(stderr, ") [lc=%d, lp=%d, pb=%d | cands=%d] */\n", lc, lp, pb, num_candidates);
     
     fprintf(stderr, "/* %-20s | %-10s | %-12s | %-12s | %-12s\n", "File", "New Size", "vs Identity", "vs Seed", "vs Previous");
     for (int i = 0; i < file_count; i++) {
@@ -193,6 +202,15 @@ void print_detailed_report(int file_count, FileData *files, size_t *new_sizes,
         fprintf(stderr, " * %-20s | %10zu | %+11.2f%% | %+11.2f%% | %+11.2f%%\n", 
                 files[i].filename, new_sizes[i], pct_id, pct_seed, pct_prev);
     }
+    
+    // Total aggregate reporting
+    double tot_pct_id = total_baseline ? ((double)((long long)total_new - (long long)total_baseline) / total_baseline) * 100.0 : 0.0;
+    double tot_pct_seed = total_initial ? ((double)((long long)total_new - (long long)total_initial) / total_initial) * 100.0 : 0.0;
+    double tot_pct_prev = total_prev ? ((double)((long long)total_new - (long long)total_prev) / total_prev) * 100.0 : 0.0;
+    
+    fprintf(stderr, " * %-20s | %10zu | %+11.2f%% | %+11.2f%% | %+11.2f%%\n", 
+            "TOTAL", total_new, tot_pct_id, tot_pct_seed, tot_pct_prev);
+    
     fprintf(stderr, " */\n");
     fflush(stderr);
 }
@@ -277,9 +295,9 @@ int main(int argc, char **argv) {
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
     int do_reshuffle = 0, do_heuristic = 0, heur_limit = 128;
     
-    // New parameters for Variable Neighborhood Search
+    // Parameters for Variable Neighborhood Search
     int initial_swaps = 128;
-    int max_stagnation = 100;
+    int max_stagnation = 1000;
     
     const char **filenames = malloc(argc * sizeof(char*));
     int file_count = 0;
@@ -365,12 +383,18 @@ int main(int argc, char **argv) {
     uint8_t loop_start_remap[256];
     memcpy(loop_start_remap, current_remap, 256);
 
+    size_t *initial_sizes = malloc(file_count * sizeof(size_t));
     size_t current_sum = evaluate_remap(current_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, 0, NULL);
     for (int i = 0; i < file_count; i++) {
         files[i].initial_comp_size = evaluate_remap(current_remap, 1, &files[i], remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, 0, NULL);
         files[i].current_comp_size = files[i].initial_comp_size;
+        initial_sizes[i] = files[i].initial_comp_size;
     }
     size_t best_sum = current_sum;
+
+    // Report 0 (Initial Baseline State)
+    print_detailed_report(file_count, files, initial_sizes, 0, 0.0, 0, "Initial Seed Setup", 1, lc_param, lp_param, pb_param, 0);
+    free(initial_sizes);
 
     unsigned long long iterations = 0;
     int chunk_size = 256 / (1 << lc_param);
@@ -413,7 +437,7 @@ int main(int argc, char **argv) {
                 int is_global = (test_sum < best_sum);
                 
                 // Detailed Reporting Output
-                print_detailed_report(file_count, files, local_file_sizes, iterations, elapsed, num_swaps, "Random Swaps", is_global);
+                print_detailed_report(file_count, files, local_file_sizes, iterations, elapsed, num_swaps, "Random Swaps", is_global, lc_param, lp_param, pb_param, num_candidates);
                 
                 if (is_global) best_sum = test_sum;
                 current_sum = test_sum;
@@ -474,7 +498,7 @@ int main(int argc, char **argv) {
                 int is_global = (best_thorough_sum < best_sum);
                 
                 // Detailed Reporting Output
-                print_detailed_report(file_count, files, best_thorough_files, iterations, elapsed, 0, "Thorough Evaluation", is_global);
+                print_detailed_report(file_count, files, best_thorough_files, iterations, elapsed, 0, "Thorough Evaluation", is_global, lc_param, lp_param, pb_param, num_candidates);
                 
                 if (is_global) best_sum = best_thorough_sum;
                 current_sum = best_thorough_sum;
