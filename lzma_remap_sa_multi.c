@@ -42,7 +42,8 @@
  *      the Previous step map. It also exposes the active LZMA settings and 
  *      candidate count.
  *    - Final Evaluation runs an absolute data entropy check via LZMA2 Preset 7 
- *      (Extreme) on all discovered result candidates.
+ *      (Extreme) on all discovered result candidates. Includes an absolute 
+ *      baseline of Identity remap mapped explicitly at lc=3, lp=0, pb=2.
  * ==============================================================================
  */
 
@@ -157,8 +158,8 @@ size_t evaluate_extreme(const uint8_t *remap_table, size_t file_size, const uint
 // ------------------------------------------------------------------------------------------
 // Reporting & Formatting Helpers
 // ------------------------------------------------------------------------------------------
-void print_remap_table_as_source(const uint8_t *remap) {
-    fprintf(stderr, "unsigned char seed_remap[256] = {\n    ");
+void print_remap_table_as_source(const char *var_name, const uint8_t *remap) {
+    fprintf(stderr, "unsigned char %s[256] = {\n    ", var_name);
     for (int i = 0; i < 256; i++) {
         if (remap[i] >= 32 && remap[i] <= 126) {
             if (remap[i] == '\'') fprintf(stderr, "'\\''"); 
@@ -448,7 +449,7 @@ int main(int argc, char **argv) {
                 num_swaps = initial_swaps; 
                 
                 // Only print the C source code structure when breaking a global record to avoid clutter
-                if (is_global) print_remap_table_as_source(current_remap);
+                if (is_global) print_remap_table_as_source("seed_remap", current_remap);
             } else {
                 stagnation_counter++;
                 if (stagnation_counter >= max_stagnation) {
@@ -509,7 +510,7 @@ int main(int argc, char **argv) {
                 num_swaps = initial_swaps;
                 stagnation_counter = 0;
                 
-                if (is_global) print_remap_table_as_source(current_remap);
+                if (is_global) print_remap_table_as_source("seed_remap", current_remap);
             } else {
                 // C. Local Minimum Confirmed - Save Candidate & Restart
                 fprintf(stderr, "\n/* Local Minimum hit at %zu. Saving Candidate %d and Reverting... */\n\n", current_sum, num_candidates + 1);
@@ -549,31 +550,54 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n/* Search finished. Iterations: %llu. Extracted %d Result Candidates. */\n\n", iterations, num_candidates);
 
     // =========================================================
+    // DUMP SAVED CANDIDATES
+    // =========================================================
+    for (int k = 0; k < num_candidates; k++) {
+        char cand_name[32];
+        snprintf(cand_name, sizeof(cand_name), "candidate_%d_remap", k + 1);
+        print_remap_table_as_source(cand_name, candidates[k]);
+    }
+
+    // =========================================================
     // FINAL EXTREME COMPRESSION EVALUATION & DYNAMIC TABLE
     // =========================================================
     fprintf(stderr, "### Final Extreme Compression Evaluation (8MB Dict, Extreme Match Finder)\n\n");
     
-    int cols = 3 + num_candidates; 
+    // Total Columns = 4 standard + candidates 
+    int cols = 4 + num_candidates; 
     int *w_cols = calloc(cols + 2, sizeof(int)); 
     
     int w_file = max_filename_len < 4 ? 4 : max_filename_len;
-    w_cols[0] = 16; 
-    w_cols[1] = 20; 
-    for (int k = 0; k < num_candidates; k++) w_cols[2 + k] = 14; 
+    w_cols[0] = 22; // Absolute Baseline
+    w_cols[1] = 16; // Current Identity
+    w_cols[2] = 20; // Current Seed
+    for (int k = 0; k < num_candidates; k++) w_cols[3 + k] = 14; 
     w_cols[cols - 1] = 19; 
-    int w_sav_id = 21, w_sav_sd = 17;
+    
+    int w_sav_abs = 18, w_sav_id = 21, w_sav_sd = 17;
     
     // Header Row Generation
-    fprintf(stderr, "| %-*s | %-*s | %-*s | ", w_file, "File", w_cols[0], "Identity (Bytes)", w_cols[1], "Initial Seed (Bytes)");
+    fprintf(stderr, "| %-*s | %-*s | %-*s | %-*s | ", 
+            w_file, "File", 
+            w_cols[0], "Abs Baseline (3/0/2)", 
+            w_cols[1], "Identity (Bytes)", 
+            w_cols[2], "Initial Seed (Bytes)");
+            
     for (int k = 0; k < num_candidates; k++) {
         char cand_head[32]; snprintf(cand_head, sizeof(cand_head), "Candidate %d", k + 1);
-        fprintf(stderr, "%-*s | ", w_cols[2 + k], cand_head);
+        fprintf(stderr, "%-*s | ", w_cols[3 + k], cand_head);
     }
-    fprintf(stderr, "%-*s | %-*s | %-*s |\n", w_cols[cols - 1], "Final Remap (Bytes)", w_sav_id, "Savings (vs Identity)", w_sav_sd, "Savings (vs Seed)");
+    
+    fprintf(stderr, "%-*s | %-*s | %-*s | %-*s |\n", 
+            w_cols[cols - 1], "Final Remap (Bytes)", 
+            w_sav_abs, "Savings (vs Abs)", 
+            w_sav_id, "Savings (vs Identity)", 
+            w_sav_sd, "Savings (vs Seed)");
 
     // Strict Markdown Separator Padding (Aligned text rendering support)
     fprintf(stderr, "|-"); for(int k = 0; k < w_file; k++) fputc('-', stderr);
     for (int c = 0; c < cols; c++) { fprintf(stderr, "-|-"); for(int k = 0; k < w_cols[c]; k++) fputc('-', stderr); }
+    fprintf(stderr, "-|-"); for(int k = 0; k < w_sav_abs; k++) fputc('-', stderr);
     fprintf(stderr, "-|-"); for(int k = 0; k < w_sav_id; k++) fputc('-', stderr);
     fprintf(stderr, "-|-"); for(int k = 0; k < w_sav_sd; k++) fputc('-', stderr);
     fprintf(stderr, "-|\n");
@@ -581,25 +605,33 @@ int main(int argc, char **argv) {
     for (int i = 0; i < file_count; i++) {
         size_t *eval_sizes = malloc(cols * sizeof(size_t));
         
-        eval_sizes[0] = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
-        eval_sizes[1] = evaluate_extreme(loop_start_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+        // Col 0: Absolute Baseline (Identity map, forcibly evaluated with lc=3, lp=0, pb=2)
+        eval_sizes[0] = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, 3, 0, 2);
+        
+        // Col 1: Current Parameter Identity map
+        eval_sizes[1] = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+        
+        // Col 2: Current Parameter Initial Seed
+        eval_sizes[2] = evaluate_extreme(loop_start_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
         
         for (int k = 0; k < num_candidates; k++) {
-            eval_sizes[2 + k] = evaluate_extreme(candidates[k], files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+            eval_sizes[3 + k] = evaluate_extreme(candidates[k], files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
         }
         
         eval_sizes[cols - 1] = evaluate_extreme(current_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
 
-        double pct_id = eval_sizes[0] ? ((double)((long long)eval_sizes[cols - 1] - (long long)eval_sizes[0]) / (double)eval_sizes[0]) * 100.0 : 0.0;
-        double pct_seed = eval_sizes[1] ? ((double)((long long)eval_sizes[cols - 1] - (long long)eval_sizes[1]) / (double)eval_sizes[1]) * 100.0 : 0.0;
+        double pct_abs  = eval_sizes[0] ? ((double)((long long)eval_sizes[cols - 1] - (long long)eval_sizes[0]) / (double)eval_sizes[0]) * 100.0 : 0.0;
+        double pct_id   = eval_sizes[1] ? ((double)((long long)eval_sizes[cols - 1] - (long long)eval_sizes[1]) / (double)eval_sizes[1]) * 100.0 : 0.0;
+        double pct_seed = eval_sizes[2] ? ((double)((long long)eval_sizes[cols - 1] - (long long)eval_sizes[2]) / (double)eval_sizes[2]) * 100.0 : 0.0;
 
-        char sav_id_str[32], sav_sd_str[32];
+        char sav_abs_str[32], sav_id_str[32], sav_sd_str[32];
+        snprintf(sav_abs_str, sizeof(sav_abs_str), "%+.2f%%", pct_abs);
         snprintf(sav_id_str, sizeof(sav_id_str), "%+.2f%%", pct_id);
         snprintf(sav_sd_str, sizeof(sav_sd_str), "%+.2f%%", pct_seed);
 
         fprintf(stderr, "| %-*s | ", w_file, files[i].filename);
         for (int c = 0; c < cols; c++) fprintf(stderr, "%*zu | ", w_cols[c], eval_sizes[c]);
-        fprintf(stderr, "%*s | %*s |\n", w_sav_id, sav_id_str, w_sav_sd, sav_sd_str);
+        fprintf(stderr, "%*s | %*s | %*s |\n", w_sav_abs, sav_abs_str, w_sav_id, sav_id_str, w_sav_sd, sav_sd_str);
         
         free(eval_sizes);
     }
