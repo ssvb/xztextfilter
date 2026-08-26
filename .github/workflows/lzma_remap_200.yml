@@ -1,0 +1,30 @@
+name: LZMA Stochastic Optimization 200
+
+on:
+  push:
+    branches: [ "main", "remapfilter_v2" ]
+  workflow_dispatch: # Allows manual triggering from the UI
+
+jobs:
+  optimize-remap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev gcc
+
+      - name: Compile Optimizer
+        run: |
+          gcc -O3 -o lzma_remap_sa_multi lzma_remap_sa_multi.c -llzma -lm
+
+      - name: Run Simulated Annealing (5 Hours)
+        run: |
+          # The C program takes the timeout in seconds.
+          # 5 hours = 18000 seconds. Setting to 17900 to ensure graceful C exit
+          # before the GitHub Actions runner forcibly terminates the container.
+          ./lzma_remap_sa_multi --lc=2 --lp=0 --pb=0 --heuristic --swaps=256 --timeout=17900 english.txt english.html

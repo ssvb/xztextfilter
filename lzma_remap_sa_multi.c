@@ -41,10 +41,12 @@
  *      confirmed. The table is archived as a "Result Candidate", the bit array 
  *      is reset, and a new search path begins.
  * 
- * 6. Isolated Extreme Evaluation Reporting
- *    - Each saved candidate, plus the final unfinished remap state, gets a 
- *      dedicated markdown table evaluated at LZMA2 Preset 7 (Extreme).
- *    - Includes aggregate total summation and strict baseline comparisons.
+ * 6. Final Evaluation and Winner Selection
+ *    - Evaluates LZMA2 Preset 7 (Extreme) for all archived candidates and the 
+ *      final unfinished remap.
+ *    - Caches baseline metrics (Identity, Seed) to prevent redundant computation.
+ *    - Sorts all candidates based on their total compressed size (compression 
+ *      ratio) and highlights the top-ranking candidate as the Winner.
  * ==============================================================================
  */
 
@@ -89,7 +91,15 @@ typedef struct {
     int dict_param_kb, lc_param, lp_param, pb_param;
     time_t start_time;
     int timeout;
+    int do_normalize; // Determines if heuristic tables should be sorted
 } HeurContext;
+
+typedef struct {
+    int original_idx;
+    uint8_t remap[256];
+    size_t *file_s_rem;
+    size_t total_rem;
+} FinalEval;
 
 void print_help(const char *prog_name) {
     printf("Usage: %s [OPTIONS] <input_file_1> [input_file_2 ...]\n\n", prog_name);
@@ -98,6 +108,7 @@ void print_help(const char *prog_name) {
     printf("  --timeout=SEC     Set timeout in seconds (default: 600).\n");
     printf("  --reshuffle       Randomize the initial remap table before starting.\n");
     printf("  --heuristic[=N]   Run exhaustive subchunk scaling pre-pass (default N=128).\n");
+    printf("  --normalize       Enable normalization (sorting) of the remap tables (disabled by default).\n");
     printf("  --swaps=N         Initial number of simultaneous pair swaps (default: 128).\n");
     printf("  --stagnation=K    Iterations without improvement before halving swaps (default: 1000).\n");
     printf("  --dict=KB         Set LZMA dictionary size in kilobytes (default: 4).\n");
@@ -154,6 +165,14 @@ size_t evaluate_extreme(const uint8_t *remap_table, size_t file_size, const uint
                         int lc, int lp, int pb) {
     for (size_t j = 0; j < file_size; j++) remapped_buf[j] = remap_table[in_buf[j]];
     return compress_buffer_extreme(remapped_buf, file_size, out_buf, out_capacity, lc, lp, pb);
+}
+
+int cmp_eval(const void *a, const void *b) {
+    size_t sum_a = ((const FinalEval*)a)->total_rem;
+    size_t sum_b = ((const FinalEval*)b)->total_rem;
+    if (sum_a < sum_b) return -1;
+    if (sum_a > sum_b) return 1;
+    return 0;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -267,7 +286,11 @@ void generate_partitions(int element_idx, int num_active_chunks, int *counts, in
             for (int j = 0; j < ctx->S; j++) heur_remap[c * (ctx->M * ctx->S) + offset + j] = i * ctx->S + j; 
             fill[c]++;
         }
-        normalize_remap(heur_remap, ctx->lc_param);
+        
+        if (ctx->do_normalize) {
+            normalize_remap(heur_remap, ctx->lc_param);
+        }
+        
         size_t test_sum = evaluate_remap(heur_remap, ctx->file_count, ctx->files, ctx->remapped_buf, ctx->out_buf, ctx->out_capacity, ctx->dict_param_kb, ctx->lc_param, ctx->lp_param, ctx->pb_param, ctx->best_heur_sum, NULL);
         if (test_sum < ctx->best_heur_sum) {
             ctx->best_heur_sum = test_sum;
@@ -296,6 +319,7 @@ int main(int argc, char **argv) {
     int timeout = 600; 
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
     int do_reshuffle = 0, do_heuristic = 0, heur_limit = 128;
+    int do_normalize = 0;
     
     // Parameters for Variable Neighborhood Search
     int initial_swaps = 128;
@@ -310,6 +334,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--reshuffle") == 0) do_reshuffle = 1;
         else if (strcmp(argv[i], "--heuristic") == 0) do_heuristic = 1;
         else if (strncmp(argv[i], "--heuristic=", 12) == 0) { do_heuristic = 1; heur_limit = atoi(argv[i] + 12); }
+        else if (strcmp(argv[i], "--normalize") == 0) do_normalize = 1;
         else if (strncmp(argv[i], "--swaps=", 8) == 0) initial_swaps = atoi(argv[i] + 8);
         else if (strncmp(argv[i], "--stagnation=", 13) == 0) max_stagnation = atoi(argv[i] + 13);
         else if (strncmp(argv[i], "--dict=", 7) == 0) dict_param_kb = atoi(argv[i] + 7);
@@ -362,7 +387,8 @@ int main(int argc, char **argv) {
         HeurContext ctx = { .C = 1 << lc_param, .heur_tested = 0, .heur_limit = heur_limit, .best_heur_sum = baseline_sum, 
                             .file_count = file_count, .files = files, .remapped_buf = remapped_buf, .out_buf = out_buf, 
                             .out_capacity = out_capacity, .dict_param_kb = dict_param_kb, .lc_param = lc_param, 
-                            .lp_param = lp_param, .pb_param = pb_param, .start_time = start_time, .timeout = timeout };
+                            .lp_param = lp_param, .pb_param = pb_param, .start_time = start_time, .timeout = timeout,
+                            .do_normalize = do_normalize };
         for (int i = 0; i < 256; i++) ctx.best_heur_remap[i] = i; 
         int M = 2;
         while (M * ctx.C <= 256 && ctx.heur_tested < ctx.heur_limit) {
@@ -379,7 +405,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    normalize_remap(current_remap, lc_param);
+    if (do_normalize) normalize_remap(current_remap, lc_param);
     
     // Save the finalized Initial Seed
     uint8_t loop_start_remap[256];
@@ -464,7 +490,8 @@ int main(int argc, char **argv) {
                 }
             }
             
-            normalize_remap(test_remap, lc_param);
+            if (do_normalize) normalize_remap(test_remap, lc_param);
+            
             size_t *local_file_sizes = malloc(file_count * sizeof(size_t));
             size_t test_sum = evaluate_remap(test_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, current_sum, local_file_sizes);
             
@@ -519,7 +546,7 @@ int main(int argc, char **argv) {
                     uint8_t test_remap[256];
                     memcpy(test_remap, current_remap, 256);
                     uint8_t tmp = test_remap[i]; test_remap[i] = test_remap[j]; test_remap[j] = tmp;
-                    normalize_remap(test_remap, lc_param);
+                    if (do_normalize) normalize_remap(test_remap, lc_param);
                     
                     size_t *local_file_sizes = malloc(file_count * sizeof(size_t));
                     size_t test_sum = evaluate_remap(test_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, best_thorough_sum, local_file_sizes);
@@ -573,7 +600,7 @@ int main(int argc, char **argv) {
                 } else {
                     memcpy(current_remap, loop_start_remap, 256);
                 }
-                normalize_remap(current_remap, lc_param);
+                if (do_normalize) normalize_remap(current_remap, lc_param);
                 
                 // CRITICAL: We must re-evaluate the reset state and update the file sizes 
                 // so the "vs Previous" reporting starts fresh from the new baseline peak.
@@ -615,14 +642,56 @@ int main(int argc, char **argv) {
     int w_abs = 20, w_id = 16, w_sd = 20, w_rem = 19;
     int w_s_abs = 16, w_s_id = 21, w_s_sd = 17;
 
-    for (int cand_idx = 0; cand_idx <= num_candidates; cand_idx++) {
-        uint8_t *target_remap = (cand_idx == num_candidates) ? current_remap : candidates[cand_idx];
+    // Cache common baseline evaluations to prevent N * Candidates extreme compression cycles
+    size_t *file_s_abs = malloc(file_count * sizeof(size_t));
+    size_t *file_s_id = malloc(file_count * sizeof(size_t));
+    size_t *file_s_sd = malloc(file_count * sizeof(size_t));
+    size_t total_abs = 0, total_id = 0, total_sd = 0;
+
+    for (int i = 0; i < file_count; i++) {
+        file_s_abs[i] = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, 3, 0, 2);
+        file_s_id[i]  = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+        file_s_sd[i]  = evaluate_extreme(loop_start_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
         
-        if (cand_idx == num_candidates) {
-            fprintf(stderr, "### Evaluation: Last Unfinished Remap\n\n");
-        } else {
-            fprintf(stderr, "### Evaluation: Candidate %d\n\n", cand_idx + 1);
+        total_abs += file_s_abs[i];
+        total_id += file_s_id[i];
+        total_sd += file_s_sd[i];
+    }
+
+    // Evaluate and sort all candidates
+    FinalEval *evals = malloc((num_candidates + 1) * sizeof(FinalEval));
+    for (int cand_idx = 0; cand_idx <= num_candidates; cand_idx++) {
+        evals[cand_idx].original_idx = cand_idx;
+        uint8_t *target_remap = (cand_idx == num_candidates) ? current_remap : candidates[cand_idx];
+        memcpy(evals[cand_idx].remap, target_remap, 256);
+        evals[cand_idx].file_s_rem = malloc(file_count * sizeof(size_t));
+        evals[cand_idx].total_rem = 0;
+
+        for (int i = 0; i < file_count; i++) {
+            size_t s_rem = evaluate_extreme(target_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+            evals[cand_idx].file_s_rem[i] = s_rem;
+            evals[cand_idx].total_rem += s_rem;
         }
+    }
+
+    // Sort evaluation block based on best overall compression (lowest total size)
+    qsort(evals, num_candidates + 1, sizeof(FinalEval), cmp_eval);
+
+    // Print sorted output
+    for (int rank = 0; rank <= num_candidates; rank++) {
+        int original_idx = evals[rank].original_idx;
+        
+        if (original_idx == num_candidates) {
+            fprintf(stderr, "### Evaluation: Last Unfinished Remap");
+        } else {
+            fprintf(stderr, "### Evaluation: Candidate %d", original_idx + 1);
+        }
+        
+        // Emphasize the top performing configuration
+        if (rank == 0) {
+            fprintf(stderr, "  🏆 [WINNER - BEST COMPRESSION RATIO]");
+        }
+        fprintf(stderr, "\n\n");
 
         fprintf(stderr, "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n", 
                 w_file, "File", w_abs, "Abs Baseline (3/0/2)", w_id, "Identity (Bytes)", 
@@ -639,15 +708,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "-|-"); for(int k = 0; k < w_s_sd; k++) fputc('-', stderr);
         fprintf(stderr, "-|\n");
 
-        size_t total_abs = 0, total_id = 0, total_sd = 0, total_rem = 0;
+        size_t total_rem = evals[rank].total_rem;
 
         for (int i = 0; i < file_count; i++) {
-            size_t s_abs = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, 3, 0, 2);
-            size_t s_id  = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
-            size_t s_sd  = evaluate_extreme(loop_start_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
-            size_t s_rem = evaluate_extreme(target_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
-            
-            total_abs += s_abs; total_id += s_id; total_sd += s_sd; total_rem += s_rem;
+            size_t s_abs = file_s_abs[i];
+            size_t s_id  = file_s_id[i];
+            size_t s_sd  = file_s_sd[i];
+            size_t s_rem = evals[rank].file_s_rem[i];
             
             double p_abs = s_abs ? ((double)((long long)s_rem - (long long)s_abs) / (double)s_abs) * 100.0 : 0.0;
             double p_id  = s_id  ? ((double)((long long)s_rem - (long long)s_id)  / (double)s_id)  * 100.0 : 0.0;
@@ -678,6 +745,13 @@ int main(int argc, char **argv) {
                 w_s_abs, tot_sav_abs, w_s_id, tot_sav_id, w_s_sd, tot_sav_sd);
     }
 
+    // Memory Cleanup
+    for (int cand_idx = 0; cand_idx <= num_candidates; cand_idx++) free(evals[cand_idx].file_s_rem);
+    free(evals);
+    free(file_s_abs);
+    free(file_s_id);
+    free(file_s_sd);
+    
     for (int i = 0; i < file_count; i++) free(files[i].in_buf);
     free(files);
     free(filenames);
