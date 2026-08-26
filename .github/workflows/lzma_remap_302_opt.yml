@@ -1,4 +1,4 @@
-name: LZMA Stochastic Optimization 100
+name: LZMA2 lc=3,lp=0,pb=2
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch: # Allows manual triggering from the UI
 
 jobs:
-  optimize-remap:
+  optimize-remap-302:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,7 +24,4 @@ jobs:
 
       - name: Run Simulated Annealing (5 Hours)
         run: |
-          # The C program takes the timeout in seconds.
-          # 5 hours = 18000 seconds. Setting to 17900 to ensure graceful C exit
-          # before the GitHub Actions runner forcibly terminates the container.
-          ./lzma_remap_sa_multi --lc=1 --lp=0 --pb=0 --normalize --seedfile=seed.txt --swaps=256 --timeout=17900 english.txt english.html
+          ./lzma_remap_sa_multi --lc=3 --lp=0 --pb=2 --normalize --seedfile=texteng.seed --swaps=128 --stagnation=3000 --timeout=20000 small/texteng.txt small/texteng.html
