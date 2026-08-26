@@ -21,29 +21,30 @@
  * 
  * 3. Variable Neighborhood Search (Multi-Swap Algorithm)
  *    - Starts by applying N (default: 128) random pair swaps simultaneously.
- *    - Crucial Constraint: Swaps are only valid if the elements belong to 
- *      different chunks. This preserves intra-chunk entropy while optimizing 
- *      inter-chunk mappings.
+ *    - Swaps are ONLY valid if the elements belong to different chunks.
  *    - If no improvement is found after K (default: 1000) iterations, the search 
- *      space is narrowed by halving N. This mimics simulated annealing.
+ *      space is narrowed by halving N (simulated annealing).
  * 
- * 4. Exhaustive "Thorough" Fallback and Candidate Archiving
- *    - When N drops to 1, and K iterations pass without improvement, the algorithm
- *      enters Thorough Mode, systematically testing EVERY possible valid pair.
- *    - If an improvement is found, it greedily applies it and jumps back to N=128.
+ * 4. N=1 Optimization and Tested Pair Tracking (Bit Array Collision Avoidance)
+ *    - When N drops to 1, a bit array (tested_pairs) is utilized to memorize 
+ *      the previously checked swap combinations.
+ *    - Random swaps query this array to immediately skip already-tested pairs. 
+ *    - If the random generator encounters too many tested pairs (dense space), 
+ *      the system preemptively breaks into Exhaustive Thorough mode.
+ * 
+ * 5. Exhaustive "Thorough" Fallback and Candidate Archiving
+ *    - Systematically tests EVERY possible valid pair. It consults the same 
+ *      bit array to skip previously evaluated pairs, vastly accelerating the pass.
+ *    - If an improvement is found, it greedily applies it, wipes the bit array 
+ *      clean (since the landscape changed), and jumps back to N=128.
  *    - If NO improvement is found across all possible pairs, a local minima is 
- *      confirmed. The table is saved as a "Result Candidate".
- *    - The algorithm then reverts to the initial baseline (or a fresh random 
- *      reshuffle) and begins a completely new optimization path.
+ *      confirmed. The table is archived as a "Result Candidate", the bit array 
+ *      is reset, and a new search path begins.
  * 
- * 5. Detailed Metric Reporting & Final Evaluation
- *    - Inter-iteration reports detail per-file and total aggregate delta 
- *      percentages compared to the Identity map, the Initial seed map, and 
- *      the Previous step map. It also exposes the active LZMA settings and 
- *      candidate count.
- *    - Final Evaluation runs an absolute data entropy check via LZMA2 Preset 7 
- *      (Extreme) on all discovered result candidates. Includes an absolute 
- *      baseline of Identity remap mapped explicitly at lc=3, lp=0, pb=2.
+ * 6. Isolated Extreme Evaluation Reporting
+ *    - Each saved candidate, plus the final unfinished remap state, gets a 
+ *      dedicated markdown table evaluated at LZMA2 Preset 7 (Extreme).
+ *    - Includes aggregate total summation and strict baseline comparisons.
  * ==============================================================================
  */
 
@@ -327,7 +328,7 @@ int main(int argc, char **argv) {
     srand((unsigned int)time(NULL));
 
     FileData *files = malloc(file_count * sizeof(FileData));
-    size_t max_file_size = 0; int max_filename_len = 0;
+    size_t max_file_size = 0; int max_filename_len = 5; 
     for (int i = 0; i < file_count; i++) {
         files[i].filename = filenames[i];
         if ((int)strlen(filenames[i]) > max_filename_len) max_filename_len = (int)strlen(filenames[i]);
@@ -408,7 +409,13 @@ int main(int argc, char **argv) {
     // Variable Neighborhood Search State Tracking
     int num_swaps = initial_swaps;
     int stagnation_counter = 0;
-    int search_mode = 0; // 0 = Random Swaps, 1 = Thorough Evaluation
+    int search_mode = 0; 
+    
+    // Memory mapping to track evaluated node pairings.
+    // Dimensions: [256 elements] x [32 bytes]. 
+    // Bit mapping algorithm enables fast bitwise lookup to prune redundant evaluations.
+    uint8_t tested_pairs[256][32];
+    memset(tested_pairs, 0, sizeof(tested_pairs));
 
     // =========================================================
     // THE OPTIMIZATION LOOP
@@ -424,10 +431,37 @@ int main(int argc, char **argv) {
             uint8_t test_remap[256];
             memcpy(test_remap, current_remap, 256);
             
-            for (int k = 0; k < num_swaps; k++) {
-                int a = rand() % 256, b;
-                do { b = rand() % 256; } while ((a / chunk_size) == (b / chunk_size)); // Ensure distinct chunks
-                uint8_t tmp = test_remap[a]; test_remap[a] = test_remap[b]; test_remap[b] = tmp;
+            if (num_swaps == 1) {
+                int valid_pair = 0;
+                // Cap random pair guessing to prevent CPU stalls when the untested space grows sparse
+                for (int retries = 0; retries < 1000; retries++) {
+                    int a = rand() % 256, b = rand() % 256;
+                    if ((a / chunk_size) == (b / chunk_size)) continue;
+                    
+                    int min_idx = a < b ? a : b;
+                    int max_idx = a > b ? a : b;
+                    
+                    // Check bit matrix logic for collisions
+                    if (!(tested_pairs[min_idx][max_idx >> 3] & (1 << (max_idx & 7)))) {
+                        uint8_t tmp = test_remap[min_idx]; test_remap[min_idx] = test_remap[max_idx]; test_remap[max_idx] = tmp;
+                        // Log pairing as tested so we never duplicate this calculation in the current era
+                        tested_pairs[min_idx][max_idx >> 3] |= (1 << (max_idx & 7));
+                        valid_pair = 1;
+                        break;
+                    }
+                }
+                if (!valid_pair) {
+                    // Search terrain is overly saturated. Abandon random walk and default to deterministic search
+                    search_mode = 1;
+                    stagnation_counter = 0;
+                    continue; 
+                }
+            } else {
+                for (int k = 0; k < num_swaps; k++) {
+                    int a = rand() % 256, b;
+                    do { b = rand() % 256; } while ((a / chunk_size) == (b / chunk_size));
+                    uint8_t tmp = test_remap[a]; test_remap[a] = test_remap[b]; test_remap[b] = tmp;
+                }
             }
             
             normalize_remap(test_remap, lc_param);
@@ -447,6 +481,9 @@ int main(int argc, char **argv) {
                 
                 stagnation_counter = 0;
                 num_swaps = initial_swaps; 
+                
+                // Clear the tested pairs collision mapping because the global landscape just shifted
+                memset(tested_pairs, 0, sizeof(tested_pairs));
                 
                 // Only print the C source code structure when breaking a global record to avoid clutter
                 if (is_global) print_remap_table_as_source("seed_remap", current_remap);
@@ -474,6 +511,10 @@ int main(int argc, char **argv) {
             for (int i = 0; i < 256 && !found_improvement && difftime(time(NULL), start_time) < timeout; i++) {
                 for (int j = i + 1; j < 256; j++) {
                     if ((i / chunk_size) == (j / chunk_size)) continue;
+                    
+                    // Pruning phase utilizes bit array established during random swaps
+                    if (tested_pairs[i][j >> 3] & (1 << (j & 7))) continue;
+                    tested_pairs[i][j >> 3] |= (1 << (j & 7)); // Log pair state as processed
                     
                     uint8_t test_remap[256];
                     memcpy(test_remap, current_remap, 256);
@@ -510,6 +551,8 @@ int main(int argc, char **argv) {
                 num_swaps = initial_swaps;
                 stagnation_counter = 0;
                 
+                memset(tested_pairs, 0, sizeof(tested_pairs)); // Reset the array on improvement jump
+                
                 if (is_global) print_remap_table_as_source("seed_remap", current_remap);
             } else {
                 // C. Local Minimum Confirmed - Save Candidate & Restart
@@ -542,6 +585,8 @@ int main(int argc, char **argv) {
                 search_mode = 0;
                 num_swaps = initial_swaps;
                 stagnation_counter = 0;
+                
+                memset(tested_pairs, 0, sizeof(tested_pairs)); // Fresh environment clears bit state memory
             }
             free(best_thorough_files);
         }
@@ -559,90 +604,85 @@ int main(int argc, char **argv) {
     }
 
     // =========================================================
-    // FINAL EXTREME COMPRESSION EVALUATION & DYNAMIC TABLE
+    // FINAL EXTREME COMPRESSION EVALUATION
     // =========================================================
-    fprintf(stderr, "### Final Extreme Compression Evaluation (8MB Dict, Extreme Match Finder)\n\n");
+    fprintf(stderr, "==========================================================================\n");
+    fprintf(stderr, "FINAL EXTREME COMPRESSION EVALUATION (8MB Dict, Extreme Match Finder)\n");
+    fprintf(stderr, "==========================================================================\n\n");
     
-    // Total Columns = 4 standard + candidates 
-    int cols = 4 + num_candidates; 
-    int *w_cols = calloc(cols + 2, sizeof(int)); 
-    
-    int w_file = max_filename_len < 4 ? 4 : max_filename_len;
-    w_cols[0] = 22; // Absolute Baseline
-    w_cols[1] = 16; // Current Identity
-    w_cols[2] = 20; // Current Seed
-    for (int k = 0; k < num_candidates; k++) w_cols[3 + k] = 14; 
-    w_cols[cols - 1] = 19; 
-    
-    int w_sav_abs = 18, w_sav_id = 21, w_sav_sd = 17;
-    
-    // Header Row Generation
-    fprintf(stderr, "| %-*s | %-*s | %-*s | %-*s | ", 
-            w_file, "File", 
-            w_cols[0], "Abs Baseline (3/0/2)", 
-            w_cols[1], "Identity (Bytes)", 
-            w_cols[2], "Initial Seed (Bytes)");
+    // Determine static widths for rigid table alignment 
+    int w_file = max_filename_len < 7 ? 7 : max_filename_len;
+    int w_abs = 20, w_id = 16, w_sd = 20, w_rem = 19;
+    int w_s_abs = 16, w_s_id = 21, w_s_sd = 17;
+
+    for (int cand_idx = 0; cand_idx <= num_candidates; cand_idx++) {
+        uint8_t *target_remap = (cand_idx == num_candidates) ? current_remap : candidates[cand_idx];
+        
+        if (cand_idx == num_candidates) {
+            fprintf(stderr, "### Evaluation: Last Unfinished Remap\n\n");
+        } else {
+            fprintf(stderr, "### Evaluation: Candidate %d\n\n", cand_idx + 1);
+        }
+
+        fprintf(stderr, "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n", 
+                w_file, "File", w_abs, "Abs Baseline (3/0/2)", w_id, "Identity (Bytes)", 
+                w_sd, "Initial Seed (Bytes)", w_rem, "Final Remap (Bytes)", 
+                w_s_abs, "Savings (vs Abs)", w_s_id, "Savings (vs Identity)", w_s_sd, "Savings (vs Seed)");
+
+        fprintf(stderr, "|-"); for(int k = 0; k < w_file; k++) fputc('-', stderr);
+        fprintf(stderr, "-|-"); for(int k = 0; k < w_abs; k++) fputc('-', stderr);
+        fprintf(stderr, "-|-"); for(int k = 0; k < w_id; k++) fputc('-', stderr);
+        fprintf(stderr, "-|-"); for(int k = 0; k < w_sd; k++) fputc('-', stderr);
+        fprintf(stderr, "-|-"); for(int k = 0; k < w_rem; k++) fputc('-', stderr);
+        fprintf(stderr, "-|-"); for(int k = 0; k < w_s_abs; k++) fputc('-', stderr);
+        fprintf(stderr, "-|-"); for(int k = 0; k < w_s_id; k++) fputc('-', stderr);
+        fprintf(stderr, "-|-"); for(int k = 0; k < w_s_sd; k++) fputc('-', stderr);
+        fprintf(stderr, "-|\n");
+
+        size_t total_abs = 0, total_id = 0, total_sd = 0, total_rem = 0;
+
+        for (int i = 0; i < file_count; i++) {
+            size_t s_abs = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, 3, 0, 2);
+            size_t s_id  = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+            size_t s_sd  = evaluate_extreme(loop_start_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+            size_t s_rem = evaluate_extreme(target_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
             
-    for (int k = 0; k < num_candidates; k++) {
-        char cand_head[32]; snprintf(cand_head, sizeof(cand_head), "Candidate %d", k + 1);
-        fprintf(stderr, "%-*s | ", w_cols[3 + k], cand_head);
-    }
-    
-    fprintf(stderr, "%-*s | %-*s | %-*s | %-*s |\n", 
-            w_cols[cols - 1], "Final Remap (Bytes)", 
-            w_sav_abs, "Savings (vs Abs)", 
-            w_sav_id, "Savings (vs Identity)", 
-            w_sav_sd, "Savings (vs Seed)");
-
-    // Strict Markdown Separator Padding (Aligned text rendering support)
-    fprintf(stderr, "|-"); for(int k = 0; k < w_file; k++) fputc('-', stderr);
-    for (int c = 0; c < cols; c++) { fprintf(stderr, "-|-"); for(int k = 0; k < w_cols[c]; k++) fputc('-', stderr); }
-    fprintf(stderr, "-|-"); for(int k = 0; k < w_sav_abs; k++) fputc('-', stderr);
-    fprintf(stderr, "-|-"); for(int k = 0; k < w_sav_id; k++) fputc('-', stderr);
-    fprintf(stderr, "-|-"); for(int k = 0; k < w_sav_sd; k++) fputc('-', stderr);
-    fprintf(stderr, "-|\n");
-
-    for (int i = 0; i < file_count; i++) {
-        size_t *eval_sizes = malloc(cols * sizeof(size_t));
-        
-        // Col 0: Absolute Baseline (Identity map, forcibly evaluated with lc=3, lp=0, pb=2)
-        eval_sizes[0] = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, 3, 0, 2);
-        
-        // Col 1: Current Parameter Identity map
-        eval_sizes[1] = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
-        
-        // Col 2: Current Parameter Initial Seed
-        eval_sizes[2] = evaluate_extreme(loop_start_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
-        
-        for (int k = 0; k < num_candidates; k++) {
-            eval_sizes[3 + k] = evaluate_extreme(candidates[k], files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+            total_abs += s_abs; total_id += s_id; total_sd += s_sd; total_rem += s_rem;
+            
+            double p_abs = s_abs ? ((double)((long long)s_rem - (long long)s_abs) / (double)s_abs) * 100.0 : 0.0;
+            double p_id  = s_id  ? ((double)((long long)s_rem - (long long)s_id)  / (double)s_id)  * 100.0 : 0.0;
+            double p_sd  = s_sd  ? ((double)((long long)s_rem - (long long)s_sd)  / (double)s_sd)  * 100.0 : 0.0;
+            
+            char sav_abs_str[32], sav_id_str[32], sav_sd_str[32];
+            snprintf(sav_abs_str, sizeof(sav_abs_str), "%+.2f%%", p_abs);
+            snprintf(sav_id_str, sizeof(sav_id_str), "%+.2f%%", p_id);
+            snprintf(sav_sd_str, sizeof(sav_sd_str), "%+.2f%%", p_sd);
+            
+            fprintf(stderr, "| %-*s | %*zu | %*zu | %*zu | %*zu | %*s | %*s | %*s |\n", 
+                    w_file, files[i].filename, w_abs, s_abs, w_id, s_id, w_sd, s_sd, w_rem, s_rem, 
+                    w_s_abs, sav_abs_str, w_s_id, sav_id_str, w_s_sd, sav_sd_str);
         }
         
-        eval_sizes[cols - 1] = evaluate_extreme(current_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
-
-        double pct_abs  = eval_sizes[0] ? ((double)((long long)eval_sizes[cols - 1] - (long long)eval_sizes[0]) / (double)eval_sizes[0]) * 100.0 : 0.0;
-        double pct_id   = eval_sizes[1] ? ((double)((long long)eval_sizes[cols - 1] - (long long)eval_sizes[1]) / (double)eval_sizes[1]) * 100.0 : 0.0;
-        double pct_seed = eval_sizes[2] ? ((double)((long long)eval_sizes[cols - 1] - (long long)eval_sizes[2]) / (double)eval_sizes[2]) * 100.0 : 0.0;
-
-        char sav_abs_str[32], sav_id_str[32], sav_sd_str[32];
-        snprintf(sav_abs_str, sizeof(sav_abs_str), "%+.2f%%", pct_abs);
-        snprintf(sav_id_str, sizeof(sav_id_str), "%+.2f%%", pct_id);
-        snprintf(sav_sd_str, sizeof(sav_sd_str), "%+.2f%%", pct_seed);
-
-        fprintf(stderr, "| %-*s | ", w_file, files[i].filename);
-        for (int c = 0; c < cols; c++) fprintf(stderr, "%*zu | ", w_cols[c], eval_sizes[c]);
-        fprintf(stderr, "%*s | %*s | %*s |\n", w_sav_abs, sav_abs_str, w_sav_id, sav_id_str, w_sav_sd, sav_sd_str);
+        // Output Aggregate Total Data
+        double tot_p_abs = total_abs ? ((double)((long long)total_rem - (long long)total_abs) / (double)total_abs) * 100.0 : 0.0;
+        double tot_p_id  = total_id  ? ((double)((long long)total_rem - (long long)total_id)  / (double)total_id)  * 100.0 : 0.0;
+        double tot_p_sd  = total_sd  ? ((double)((long long)total_rem - (long long)total_sd)  / (double)total_sd)  * 100.0 : 0.0;
         
-        free(eval_sizes);
+        char tot_sav_abs[32], tot_sav_id[32], tot_sav_sd[32];
+        snprintf(tot_sav_abs, sizeof(tot_sav_abs), "%+.2f%%", tot_p_abs);
+        snprintf(tot_sav_id, sizeof(tot_sav_id), "%+.2f%%", tot_p_id);
+        snprintf(tot_sav_sd, sizeof(tot_sav_sd), "%+.2f%%", tot_p_sd);
+
+        fprintf(stderr, "| %-*s | %*zu | %*zu | %*zu | %*zu | %*s | %*s | %*s |\n\n", 
+                w_file, "TOTAL", w_abs, total_abs, w_id, total_id, w_sd, total_sd, w_rem, total_rem, 
+                w_s_abs, tot_sav_abs, w_s_id, tot_sav_id, w_s_sd, tot_sav_sd);
     }
-    fprintf(stderr, "\n");
 
     for (int i = 0; i < file_count; i++) free(files[i].in_buf);
     free(files);
     free(filenames);
     free(remapped_buf); 
     free(out_buf);
-    free(w_cols);
     free(candidates);
     
     return EXIT_SUCCESS;
