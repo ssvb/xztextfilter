@@ -24,4 +24,4 @@ jobs:
 
       - name: Run Simulated Annealing (5 Hours)
         run: |
-          ./lzma_remap_sa_multi --lc=3 --lp=0 --pb=2 --normalize --seedfile=texteng.seed --swaps=128 --stagnation=3000 --timeout=20000 small/texteng.txt small/texteng.html
+          ./lzma_remap_sa_multi --lc=3 --lp=0 --pb=2 --seedfile=texteng.seed --swaps=128 --stagnation=3000 --timeout=20000 small/texteng.txt small/texteng.html
