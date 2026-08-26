@@ -15,34 +15,41 @@
  *    - dict (Dictionary Size): Configurable via '--dict=' in KB (default: 4).
  *    - lc (Literal Context): Configurable via '--lc=' (default: 3). 
  * 
- * 2. Progressive Heuristic Pre-Pass Partitioning
+ * 2. External Seed Parsing & Validation
+ *    - Dynamically scans a target file for the exact seed declaration using the 
+ *      lc/lp/pb signature.
+ *    - Implements a validation pass using a frequency mapping array to guarantee
+ *      the parsed result is a strict 1:1 permutation of the 0-255 byte space.
+ * 
+ * 3. Progressive Heuristic Pre-Pass Partitioning
  *    - Recursively evaluates subsets of increasing granularity (M=2, 4, 8) to
  *      find the most structurally compatible initial seed.
  * 
- * 3. Variable Neighborhood Search (Multi-Swap Algorithm)
- *    - Starts by applying N (default: 128) random pair swaps simultaneously.
- *    - Swaps are ONLY valid if the elements belong to different chunks.
+ * 4. Variable Neighborhood Search (Multi-Swap Algorithm)
+ *    - Starts by applying N (default: 256) random pair swaps simultaneously.
+ *    - If '--normalize' is active, swaps are ONLY valid if elements belong to 
+ *      different chunks. Otherwise, global swaps are permitted.
  *    - If no improvement is found after K (default: 1000) iterations, the search 
  *      space is narrowed by halving N (simulated annealing).
  * 
- * 4. N=1 Optimization and Tested Pair Tracking (Bit Array Collision Avoidance)
+ * 5. N=1 Optimization and Tested Pair Tracking (Bit Array Collision Avoidance)
  *    - When N drops to 1, a bit array (tested_pairs) is utilized to memorize 
  *      the previously checked swap combinations.
  *    - Random swaps query this array to immediately skip already-tested pairs. 
  *    - If the random generator encounters too many tested pairs (dense space), 
  *      the system preemptively breaks into Exhaustive Thorough mode.
  * 
- * 5. Exhaustive "Thorough" Fallback and Candidate Archiving
+ * 6. Exhaustive "Thorough" Fallback and Candidate Archiving
  *    - Systematically tests EVERY possible valid pair. It consults the same 
  *      bit array to skip previously evaluated pairs, vastly accelerating the pass.
  *    - If an improvement is found, it greedily applies it, wipes the bit array 
- *      clean (since the landscape changed), and jumps back to N=128.
+ *      clean (since the landscape changed), and jumps back to N=256.
  *    - If NO improvement is found across all possible pairs, a local minima is 
  *      confirmed. The table is archived as a "Result Candidate", the bit array 
  *      is reset, and a new search path begins.
  * 
- * 6. Final Evaluation and Winner Selection
- *    - Evaluates LZMA2 Preset 7 (Extreme) for all archived candidates and the 
+ * 7. Final Evaluation and Winner Selection
+ *    - Evaluates LZMA2 Preset 6 (Extreme) for all archived candidates and the 
  *      final unfinished remap.
  *    - Caches baseline metrics (Identity, Seed) to prevent redundant computation.
  *    - Sorts all candidates based on their total compressed size (compression 
@@ -107,9 +114,10 @@ void print_help(const char *prog_name) {
     printf("  --help            Show this help message and exit.\n");
     printf("  --timeout=SEC     Set timeout in seconds (default: 600).\n");
     printf("  --reshuffle       Randomize the initial remap table before starting.\n");
+    printf("  --seedfile=FILE   Load the seed remap from an external file.\n");
     printf("  --heuristic[=N]   Run exhaustive subchunk scaling pre-pass (default N=128).\n");
     printf("  --normalize       Enable normalization (sorting) of the remap tables (disabled by default).\n");
-    printf("  --swaps=N         Initial number of simultaneous pair swaps (default: 128).\n");
+    printf("  --swaps=N         Initial number of simultaneous pair swaps (default: 256).\n");
     printf("  --stagnation=K    Iterations without improvement before halving swaps (default: 1000).\n");
     printf("  --dict=KB         Set LZMA dictionary size in kilobytes (default: 4).\n");
     printf("  --lc=BITS         Set LZMA literal context bits (1-4, default: 3).\n");
@@ -134,8 +142,9 @@ size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, s
 
 size_t compress_buffer_extreme(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, int lc_param, int lp_param, int pb_param) {
     lzma_options_lzma opt;
-    if (lzma_lzma_preset(&opt, 7 | LZMA_PRESET_EXTREME)) return out_capacity + 1;
-    opt.dict_size = 8 * 1024 * 1024; 
+    // Algorithm: Apply LZMA2 Preset 6 (Extreme) for maximum exhaustive evaluation.
+    if (lzma_lzma_preset(&opt, 6 | LZMA_PRESET_EXTREME)) return out_capacity + 1;
+    opt.dict_size = 8 * 1024 * 1024; // 8MB dictionary as specified
     opt.lc = lc_param; opt.lp = lp_param; opt.pb = pb_param;
     lzma_filter filters[2] = { { .id = LZMA_FILTER_LZMA2, .options = &opt }, { .id = LZMA_VLI_UNKNOWN, .options = NULL } };
     size_t out_pos = 0;
@@ -173,6 +182,98 @@ int cmp_eval(const void *a, const void *b) {
     if (sum_a < sum_b) return -1;
     if (sum_a > sum_b) return 1;
     return 0;
+}
+
+// ------------------------------------------------------------------------------------------
+// Rigid Seed File Parser & Permutation Validator
+// ------------------------------------------------------------------------------------------
+int load_seed_from_file(const char *filename, int lc, int lp, int pb, unsigned char *out_remap) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Could not open seed file '%s'.\n", filename);
+        return 0;
+    }
+
+    char target_decl[64];
+    snprintf(target_decl, sizeof(target_decl), "remap_seed_%d%d%d", lc, lp, pb);
+
+    char line[512];
+    int found_decl = 0;
+
+    // Scan for dynamic target array declaration
+    while (fgets(line, sizeof(line), file)) {
+        if (strstr(line, target_decl) != NULL) {
+            found_decl = 1;
+            break;
+        }
+    }
+
+    if (!found_decl) {
+        fprintf(stderr, "Error: Configuration '%s' not found in seed file.\n", target_decl);
+        fclose(file);
+        return 0; 
+    }
+
+    int in_array = 0;
+    if (strchr(line, '{')) in_array = 1;
+    else {
+        while (fgets(line, sizeof(line), file)) {
+            if (strchr(line, '{')) {
+                in_array = 1;
+                break;
+            }
+        }
+    }
+
+    if (!in_array) {
+        fclose(file);
+        return 0; 
+    }
+
+    // Extract exact byte values
+    int count = 0, c;
+    while (count < 256 && (c = fgetc(file)) != EOF) {
+        if (c == '0') {
+            int next = fgetc(file);
+            if (next == 'x' || next == 'X') {
+                unsigned int val;
+                if (fscanf(file, "%2x", &val) == 1) out_remap[count++] = (unsigned char)val;
+            } else ungetc(next, file); 
+        } else if (c == '\'') {
+            int char_val = fgetc(file);
+            if (char_val == '\\') { 
+                int escaped = fgetc(file);
+                if (escaped == '\'') char_val = '\'';
+                else if (escaped == '\\') char_val = '\\';
+            }
+            out_remap[count++] = (unsigned char)char_val;
+            while ((c = fgetc(file)) != EOF && c != '\'') { }
+        } else if (c == '}') break; 
+    }
+    fclose(file);
+
+    if (count != 256) {
+        fprintf(stderr, "Error: Parsed %d bytes, expected 256.\n", count);
+        return 0;
+    }
+
+    /**
+     * Algorithm: Validating Permutation
+     * We iterate through the parsed 256-byte array and use a frequency map (boolean array)
+     * to guarantee no duplicates exist. Since the input array size is constrained to 256 
+     * and bounds are enforced by the uint8_t types, checking for uniqueness mathematically 
+     * proves it is a valid 0-255 mapping.
+     */
+    int seen[256] = {0};
+    for (int i = 0; i < 256; i++) {
+        if (seen[out_remap[i]]) {
+            fprintf(stderr, "Error: Seed file array contains duplicate value 0x%02X.\n", out_remap[i]);
+            return 0; 
+        }
+        seen[out_remap[i]] = 1;
+    }
+
+    return 1;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -287,9 +388,7 @@ void generate_partitions(int element_idx, int num_active_chunks, int *counts, in
             fill[c]++;
         }
         
-        if (ctx->do_normalize) {
-            normalize_remap(heur_remap, ctx->lc_param);
-        }
+        if (ctx->do_normalize) normalize_remap(heur_remap, ctx->lc_param);
         
         size_t test_sum = evaluate_remap(heur_remap, ctx->file_count, ctx->files, ctx->remapped_buf, ctx->out_buf, ctx->out_capacity, ctx->dict_param_kb, ctx->lc_param, ctx->lp_param, ctx->pb_param, ctx->best_heur_sum, NULL);
         if (test_sum < ctx->best_heur_sum) {
@@ -320,9 +419,10 @@ int main(int argc, char **argv) {
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
     int do_reshuffle = 0, do_heuristic = 0, heur_limit = 128;
     int do_normalize = 0;
+    const char *seedfile_path = NULL;
     
     // Parameters for Variable Neighborhood Search
-    int initial_swaps = 128;
+    int initial_swaps = 256;
     int max_stagnation = 1000;
     
     const char **filenames = malloc(argc * sizeof(char*));
@@ -332,6 +432,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { print_help(argv[0]); free(filenames); return EXIT_SUCCESS; }
         else if (strncmp(argv[i], "--timeout=", 10) == 0) timeout = atoi(argv[i] + 10);
         else if (strcmp(argv[i], "--reshuffle") == 0) do_reshuffle = 1;
+        else if (strncmp(argv[i], "--seedfile=", 11) == 0) seedfile_path = argv[i] + 11;
         else if (strcmp(argv[i], "--heuristic") == 0) do_heuristic = 1;
         else if (strncmp(argv[i], "--heuristic=", 12) == 0) { do_heuristic = 1; heur_limit = atoi(argv[i] + 12); }
         else if (strcmp(argv[i], "--normalize") == 0) do_normalize = 1;
@@ -376,6 +477,13 @@ int main(int argc, char **argv) {
     size_t baseline_sum = evaluate_remap(identity_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, 0, NULL);
     for (int i = 0; i < file_count; i++) {
         files[i].baseline_comp_size = evaluate_remap(identity_remap, 1, &files[i], remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, 0, NULL);
+    }
+
+    // Process external seed logic before main loop
+    if (seedfile_path) {
+        if (!load_seed_from_file(seedfile_path, lc_param, lp_param, pb_param, seed_remap)) {
+            return EXIT_FAILURE; 
+        }
     }
     
     time_t start_time = time(NULL);
@@ -459,15 +567,22 @@ int main(int argc, char **argv) {
             
             if (num_swaps == 1) {
                 int valid_pair = 0;
-                // Cap random pair guessing to prevent CPU stalls when the untested space grows sparse
+                // Algorithm: Cap random pair guessing to prevent CPU stalls
                 for (int retries = 0; retries < 1000; retries++) {
                     int a = rand() % 256, b = rand() % 256;
-                    if ((a / chunk_size) == (b / chunk_size)) continue;
+                    if (a == b) continue; 
+                    
+                    /**
+                     * Algorithm: Chunk Compatibility
+                     * Evaluates if we are in normalize mode. If so, swaps are ONLY 
+                     * valid if the elements belong to different LZMA chunks.
+                     */
+                    if (do_normalize && ((a / chunk_size) == (b / chunk_size))) continue;
                     
                     int min_idx = a < b ? a : b;
                     int max_idx = a > b ? a : b;
                     
-                    // Check bit matrix logic for collisions
+                    // Algorithm: Bit matrix logic for O(1) collision detection
                     if (!(tested_pairs[min_idx][max_idx >> 3] & (1 << (max_idx & 7)))) {
                         uint8_t tmp = test_remap[min_idx]; test_remap[min_idx] = test_remap[max_idx]; test_remap[max_idx] = tmp;
                         // Log pairing as tested so we never duplicate this calculation in the current era
@@ -485,7 +600,9 @@ int main(int argc, char **argv) {
             } else {
                 for (int k = 0; k < num_swaps; k++) {
                     int a = rand() % 256, b;
-                    do { b = rand() % 256; } while ((a / chunk_size) == (b / chunk_size));
+                    do { 
+                        b = rand() % 256; 
+                    } while (a == b || (do_normalize && ((a / chunk_size) == (b / chunk_size))));
                     uint8_t tmp = test_remap[a]; test_remap[a] = test_remap[b]; test_remap[b] = tmp;
                 }
             }
@@ -518,7 +635,7 @@ int main(int argc, char **argv) {
                 stagnation_counter++;
                 if (stagnation_counter >= max_stagnation) {
                     if (num_swaps > 1) {
-                        num_swaps /= 2; // Annealing: Constrict search radius
+                        num_swaps /= 2; // Algorithm: Simulated Annealing search constriction
                         stagnation_counter = 0;
                     } else {
                         search_mode = 1; // Exhausted random combinations at N=1, switch to thorough
@@ -537,7 +654,7 @@ int main(int argc, char **argv) {
             
             for (int i = 0; i < 256 && !found_improvement && difftime(time(NULL), start_time) < timeout; i++) {
                 for (int j = i + 1; j < 256; j++) {
-                    if ((i / chunk_size) == (j / chunk_size)) continue;
+                    if (do_normalize && ((i / chunk_size) == (j / chunk_size))) continue;
                     
                     // Pruning phase utilizes bit array established during random swaps
                     if (tested_pairs[i][j >> 3] & (1 << (j & 7))) continue;
