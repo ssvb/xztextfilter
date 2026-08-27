@@ -8,7 +8,7 @@
 
 /**
  * ==============================================================================
- * ALGORITHM OVERVIEW: Chunk-Partitioned Variable Neighborhood Search
+ * ALGORITHM OVERVIEW: Variable Neighborhood Search & Bit-Heuristics
  * ==============================================================================
  * 
  * 1. Tunable LZMA Markov Chain Modeling (Fast Search Phase)
@@ -21,9 +21,12 @@
  *    - Implements a validation pass using a frequency mapping array to guarantee
  *      the parsed result is a strict 1:1 permutation of the 0-255 byte space.
  * 
- * 3. Progressive Heuristic Pre-Pass Partitioning
- *    - Recursively evaluates subsets of increasing granularity (M=2, 4, 8) to
- *      find the most structurally compatible initial seed.
+ * 3. Exhaustive Bit-Permutation Heuristic Pre-Pass
+ *    - When '--heuristic' is active, the system generates all 40,320 (8!) 
+ *      possible remaps derived from swapping bits within a byte of the identity 
+ *      remap using Heap's Algorithm.
+ *    - Each candidate is rigorously evaluated using LZMA Extreme (Preset 6, 8MB dict).
+ *    - The best permutation anchors the starting state for the multi-swap phase.
  * 
  * 4. Variable Neighborhood Search (Multi-Swap Algorithm)
  *    - Starts by applying N (default: 256) random pair swaps simultaneously.
@@ -49,11 +52,14 @@
  *      is reset, and a new search path begins.
  * 
  * 7. Final Evaluation and Winner Selection
- *    - Evaluates LZMA2 Preset 6 (Extreme) for all archived candidates and the 
- *      final unfinished remap.
- *    - Caches baseline metrics (Identity, Seed) to prevent redundant computation.
- *    - Sorts all candidates based on their total compressed size (compression 
- *      ratio) and highlights the top-ranking candidate as the Winner.
+ *    - Evaluates LZMA2 Preset 6 (Extreme, 8MB dict) for all archived candidates 
+ *      and the final unfinished remap.
+ *    - Sorts all candidates based on their total compressed size.
+ * 
+ * 8. Result Persistence & Seed Evolution
+ *    - If the final extreme evaluation determines the absolute best candidate 
+ *      surpasses the initial loaded seed, the system physically patches the 
+ *      original seed file, substituting the new permutation under a '.new' file.
  * ==============================================================================
  */
 
@@ -86,22 +92,6 @@ typedef struct {
 } FileData;
 
 typedef struct {
-    int M, C, S;
-    unsigned long long heur_tested, heur_limit;
-    size_t best_heur_sum;
-    uint8_t best_heur_remap[256];
-    int file_count;
-    FileData *files;
-    uint8_t *remapped_buf;
-    uint8_t *out_buf;
-    size_t out_capacity;
-    int dict_param_kb, lc_param, lp_param, pb_param;
-    time_t start_time;
-    int timeout;
-    int do_normalize; // Determines if heuristic tables should be sorted
-} HeurContext;
-
-typedef struct {
     int original_idx;
     uint8_t remap[256];
     size_t *file_s_rem;
@@ -115,7 +105,7 @@ void print_help(const char *prog_name) {
     printf("  --timeout=SEC     Set timeout in seconds (default: 600).\n");
     printf("  --reshuffle       Randomize the initial remap table before starting.\n");
     printf("  --seedfile=FILE   Load the seed remap from an external file.\n");
-    printf("  --heuristic[=N]   Run exhaustive subchunk scaling pre-pass (default N=128).\n");
+    printf("  --heuristic       Run exhaustive 8-bit permutation heuristic (40,320 evals).\n");
     printf("  --normalize       Enable normalization (sorting) of the remap tables (disabled by default).\n");
     printf("  --swaps=N         Initial number of simultaneous pair swaps (default: 256).\n");
     printf("  --stagnation=K    Iterations without improvement before halving swaps (default: 1000).\n");
@@ -276,6 +266,72 @@ int load_seed_from_file(const char *filename, int lc, int lp, int pb, unsigned c
     return 1;
 }
 
+/**
+ * ==============================================================================
+ * Algorithm: Safe File Stream Patching (Seed Upgrade)
+ * ==============================================================================
+ * Streams the original file to a new file character by character. 
+ * When the target declaration signature is matched, it safely skips the old 
+ * array initialization payload and injects the new optimized permutation, 
+ * preserving all surrounding code, comments, and file structure.
+ */
+void save_new_seed_file(const char *orig_path, int lc, int lp, int pb, const uint8_t *best_remap) {
+    char new_path[1024];
+    snprintf(new_path, sizeof(new_path), "%s.new", orig_path);
+    
+    FILE *in = fopen(orig_path, "r");
+    FILE *out = fopen(new_path, "w");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return;
+    }
+
+    char target_decl[64];
+    snprintf(target_decl, sizeof(target_decl), "remap_seed_%d%d%d", lc, lp, pb);
+    int target_len = strlen(target_decl);
+    
+    int match_idx = 0;
+    int in_target = 0;
+    int c;
+
+    while ((c = fgetc(in)) != EOF) {
+        if (!in_target) {
+            fputc(c, out);
+            if (c == target_decl[match_idx]) {
+                match_idx++;
+                if (match_idx == target_len) {
+                    in_target = 1; // Discovered the specific C array declaration block!
+                }
+            } else {
+                match_idx = (c == target_decl[0]) ? 1 : 0;
+            }
+        } else {
+            fputc(c, out);
+            // Search dynamically for the opening block '{' regardless of newlines/whitespace
+            if (c == '{') {
+                fprintf(out, "\n    ");
+                for (int i = 0; i < 256; i++) {
+                    fprintf(out, "0x%02x%s", best_remap[i], (i == 255) ? "" : ((i + 1) % 16 == 0 ? ",\n    " : ", "));
+                }
+                fprintf(out, "\n}");
+                
+                // Fast-forward input reader past the obsolete payload until the matching '}'
+                int skip_c;
+                while ((skip_c = fgetc(in)) != EOF) {
+                    if (skip_c == '}') break; 
+                }
+                in_target = 0;
+                match_idx = 0;
+            }
+        }
+    }
+    
+    fclose(in);
+    fclose(out);
+    fprintf(stderr, "\n/* Successfully saved optimized seed configuration to: %s */\n\n", new_path);
+}
+
 // ------------------------------------------------------------------------------------------
 // Reporting & Formatting Helpers
 // ------------------------------------------------------------------------------------------
@@ -367,57 +423,79 @@ void normalize_remap(uint8_t *remap, int lc) {
     }
 }
 
-void generate_partitions(int element_idx, int num_active_chunks, int *counts, int *assignment, HeurContext *ctx) {
-    if (ctx->heur_tested >= ctx->heur_limit) return;
-    if (difftime(time(NULL), ctx->start_time) >= ctx->timeout) return;
-    
-    if (element_idx == ctx->C * ctx->M) {
-        if (ctx->M > 2) {
-            int is_duplicate = 1;
-            for (int i = 0; i < ctx->C * ctx->M; i += 2) {
-                if (assignment[i] != assignment[i + 1]) { is_duplicate = 0; break; }
+// ------------------------------------------------------------------------------------------
+// Bit-Permutation Heuristic Evaluator
+// ------------------------------------------------------------------------------------------
+typedef struct {
+    uint8_t best_remap[256];
+    int best_perm[8];
+    size_t best_size;
+    int file_count;
+    FileData *files;
+    uint8_t *remapped_buf;
+    uint8_t *out_buf;
+    size_t out_capacity;
+    int lc, lp, pb;
+    unsigned long long count;
+} HeuristicBitCtx;
+
+/**
+ * Algorithm: Heap's Algorithm for Exhaustive Bit-Permutation
+ * Iteratively constructs every unique permutation of an 8-element set (40,320 combinations).
+ * For each layout, it fabricates a full 256-byte translation table where every byte 
+ * has its individual bits strictly reordered according to the active permutation.
+ * Evaluates candidates aggressively via LZMA Extreme 6 preset.
+ */
+void generate_bit_permutations(int k, int *perm, HeuristicBitCtx *ctx) {
+    if (k == 1) {
+        uint8_t test_remap[256];
+        for (int i = 0; i < 256; i++) {
+            uint8_t mapped = 0;
+            for (int bit = 0; bit < 8; bit++) {
+                if (i & (1 << bit)) {
+                    mapped |= (1 << perm[bit]);
+                }
             }
-            if (is_duplicate) return; 
+            test_remap[i] = mapped;
         }
-        uint8_t heur_remap[256];
-        int fill[16] = {0};
-        for (int i = 0; i < ctx->C * ctx->M; i++) {
-            int c = assignment[i];
-            int offset = fill[c] * ctx->S;
-            for (int j = 0; j < ctx->S; j++) heur_remap[c * (ctx->M * ctx->S) + offset + j] = i * ctx->S + j; 
-            fill[c]++;
+
+        size_t total_size = 0;
+        for (int f = 0; f < ctx->file_count; f++) {
+            // Mandated evaluation constraints: Extreme LZMA 6 preset utilizing 8MB Dictionary
+            size_t s = evaluate_extreme(test_remap, ctx->files[f].file_size, ctx->files[f].in_buf, 
+                                        ctx->remapped_buf, ctx->out_buf, ctx->out_capacity, 
+                                        ctx->lc, ctx->lp, ctx->pb);
+            total_size += s;
+            if (total_size >= ctx->best_size) break; 
+        }
+
+        if (total_size < ctx->best_size) {
+            ctx->best_size = total_size;
+            memcpy(ctx->best_remap, test_remap, 256);
+            memcpy(ctx->best_perm, perm, 8 * sizeof(int));
         }
         
-        if (ctx->do_normalize) normalize_remap(heur_remap, ctx->lc_param);
-        
-        size_t test_sum = evaluate_remap(heur_remap, ctx->file_count, ctx->files, ctx->remapped_buf, ctx->out_buf, ctx->out_capacity, ctx->dict_param_kb, ctx->lc_param, ctx->lp_param, ctx->pb_param, ctx->best_heur_sum, NULL);
-        if (test_sum < ctx->best_heur_sum) {
-            ctx->best_heur_sum = test_sum;
-            memcpy(ctx->best_heur_remap, heur_remap, 256);
+        ctx->count++;
+        if (ctx->count % 1000 == 0) {
+            fprintf(stderr, "   ... evaluated %llu / 40320 candidates (best compression: %zu bytes)\r", ctx->count, ctx->best_size);
+            fflush(stderr);
         }
-        ctx->heur_tested++;
         return;
     }
-    
-    for (int c = 0; c < num_active_chunks; c++) {
-        if (counts[c] < ctx->M) {
-            counts[c]++; assignment[element_idx] = c;
-            generate_partitions(element_idx + 1, num_active_chunks, counts, assignment, ctx);
-            counts[c]--;
-            if (ctx->heur_tested >= ctx->heur_limit) return;
-        }
-    }
-    if (num_active_chunks < ctx->C) {
-        counts[num_active_chunks]++; assignment[element_idx] = num_active_chunks;
-        generate_partitions(element_idx + 1, num_active_chunks + 1, counts, assignment, ctx);
-        counts[num_active_chunks]--;
+
+    for (int i = 0; i < k; i++) {
+        generate_bit_permutations(k - 1, perm, ctx);
+        int swap_idx = (k % 2 == 0) ? i : 0;
+        int tmp = perm[swap_idx];
+        perm[swap_idx] = perm[k - 1];
+        perm[k - 1] = tmp;
     }
 }
 
 int main(int argc, char **argv) {
     int timeout = 600; 
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
-    int do_reshuffle = 0, do_heuristic = 0, heur_limit = 128;
+    int do_reshuffle = 0, do_heuristic = 0;
     int do_normalize = 0;
     const char *seedfile_path = NULL;
     
@@ -434,7 +512,6 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--reshuffle") == 0) do_reshuffle = 1;
         else if (strncmp(argv[i], "--seedfile=", 11) == 0) seedfile_path = argv[i] + 11;
         else if (strcmp(argv[i], "--heuristic") == 0) do_heuristic = 1;
-        else if (strncmp(argv[i], "--heuristic=", 12) == 0) { do_heuristic = 1; heur_limit = atoi(argv[i] + 12); }
         else if (strcmp(argv[i], "--normalize") == 0) do_normalize = 1;
         else if (strncmp(argv[i], "--swaps=", 8) == 0) initial_swaps = atoi(argv[i] + 8);
         else if (strncmp(argv[i], "--stagnation=", 13) == 0) max_stagnation = atoi(argv[i] + 13);
@@ -492,21 +569,27 @@ int main(int argc, char **argv) {
 
     // 2. Pre-Configuration Branch
     if (do_heuristic) {
-        HeurContext ctx = { .C = 1 << lc_param, .heur_tested = 0, .heur_limit = heur_limit, .best_heur_sum = baseline_sum, 
-                            .file_count = file_count, .files = files, .remapped_buf = remapped_buf, .out_buf = out_buf, 
-                            .out_capacity = out_capacity, .dict_param_kb = dict_param_kb, .lc_param = lc_param, 
-                            .lp_param = lp_param, .pb_param = pb_param, .start_time = start_time, .timeout = timeout,
-                            .do_normalize = do_normalize };
-        for (int i = 0; i < 256; i++) ctx.best_heur_remap[i] = i; 
-        int M = 2;
-        while (M * ctx.C <= 256 && ctx.heur_tested < ctx.heur_limit) {
-            ctx.M = M; ctx.S = 256 / (ctx.C * M);
-            int counts[16] = {0}, assignment[256] = {0};
-            size_t before_m_sum = ctx.best_heur_sum;
-            generate_partitions(0, 0, counts, assignment, &ctx);
-            if (ctx.best_heur_sum < before_m_sum) M *= 2; else break;
+        fprintf(stderr, "/* Starting Exhaustive Bit-Permutation Heuristic (40,320 candidates) */\n");
+        HeuristicBitCtx ctx = { 
+            .best_size = SIZE_MAX, 
+            .file_count = file_count, .files = files, 
+            .remapped_buf = remapped_buf, .out_buf = out_buf, 
+            .out_capacity = out_capacity, 
+            .lc = lc_param, .lp = lp_param, .pb = pb_param, 
+            .count = 0 
+        };
+        int perm[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        
+        generate_bit_permutations(8, perm, &ctx);
+        
+        fprintf(stderr, "\n/* Heuristic Selection Complete. Chosen size: %zu bytes. */\n", ctx.best_size);
+        fprintf(stderr, "/* Optimal Bit Permutation Mapping: */\n/* ");
+        for (int b = 0; b < 8; b++) {
+            fprintf(stderr, "[Bit %d -> Bit %d] ", b, ctx.best_perm[b]);
         }
-        memcpy(current_remap, ctx.best_heur_remap, 256);
+        fprintf(stderr, "*/\n\n");
+        
+        memcpy(current_remap, ctx.best_remap, 256);
     } else if (do_reshuffle) {
         for (int i = 255; i > 0; i--) {
             int j = rand() % (i + 1); uint8_t temp = current_remap[i]; current_remap[i] = current_remap[j]; current_remap[j] = temp;
@@ -768,7 +851,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < file_count; i++) {
         file_s_abs[i] = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, 3, 0, 2);
         file_s_id[i]  = evaluate_extreme(identity_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
-        file_s_sd[i]  = evaluate_extreme(loop_start_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
+        
+        // Critically: Evaluates strictly against the origin seed mapping (seed_remap) not intermediate heuristic states.
+        file_s_sd[i]  = evaluate_extreme(seed_remap, files[i].file_size, files[i].in_buf, remapped_buf, out_buf, out_capacity, lc_param, lp_param, pb_param);
         
         total_abs += file_s_abs[i];
         total_id += file_s_id[i];
@@ -806,7 +891,7 @@ int main(int argc, char **argv) {
         
         // Emphasize the top performing configuration
         if (rank == 0) {
-            fprintf(stderr, "  🏆 [WINNER - BEST COMPRESSION RATIO]");
+            fprintf(stderr, "  [WINNER - BEST COMPRESSION RATIO]");
         }
         fprintf(stderr, "\n\n");
 
@@ -860,6 +945,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "| %-*s | %*zu | %*zu | %*zu | %*zu | %*s | %*s | %*s |\n\n", 
                 w_file, "TOTAL", w_abs, total_abs, w_id, total_id, w_sd, total_sd, w_rem, total_rem, 
                 w_s_abs, tot_sav_abs, w_s_id, tot_sav_id, w_s_sd, tot_sav_sd);
+    }
+
+    // Determine Seed Overwrite Logic Based on Final Analytics
+    if (seedfile_path != NULL) {
+        if (evals[0].total_rem < total_sd) {
+            fprintf(stderr, "/* Best candidate (%zu bytes) empirically outperforms loaded seed (%zu bytes). Upgrading seed file... */\n", 
+                    evals[0].total_rem, total_sd);
+            save_new_seed_file(seedfile_path, lc_param, lp_param, pb_param, evals[0].remap);
+        } else {
+            fprintf(stderr, "/* Initial loaded seed remains structurally optimal against candidates. No new seed file generated. */\n");
+        }
     }
 
     // Memory Cleanup
