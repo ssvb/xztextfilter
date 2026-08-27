@@ -30,7 +30,7 @@
  *      timeout parameter to slowly lower the "Temperature" (T) over time.
  * 
  * 4. Metropolis Acceptance Criterion
- *    - Uses a normalized Energy scale E = (size / baseline_size) * 1000.
+ *    - Uses a normalized Energy scale E = (size / baseline_size) * 100000.
  *    - If a swap DECREASES or EQUALS the energy (ΔE <= 0), it is 
  *      unconditionally accepted.
  *    - If a swap INCREASES the energy (ΔE > 0), it is probabilistically
@@ -115,7 +115,7 @@ void print_remap_table_as_source(const char *var_name, const uint8_t *remap) {
  */
 void report_improvement(const uint8_t *remap, unsigned long long iter, double elapsed, double timeout,
                         int dict, int lc, int lp, int pb,
-                        size_t new_size, size_t prev_size, size_t initial_size, size_t baseline_size) {
+                        size_t new_size, size_t prev_size, size_t initial_size, size_t baseline_size, double T) {
     
     double remaining = timeout - elapsed;
     if (remaining < 0) remaining = 0.0;
@@ -133,6 +133,23 @@ void report_improvement(const uint8_t *remap, unsigned long long iter, double el
     fprintf(stderr, "Reduction vs Identity Mapping : %+10.3f%%\n", pct_id);
     fprintf(stderr, "Reduction vs Initial State    : %+10.3f%%\n", pct_init);
     fprintf(stderr, "Reduction vs Previous Step    : %+10.3f%%\n", pct_prev);
+
+    /**
+     * Algorithm: Regression Acceptance Probability Calculation
+     * Calculates the probability P(accept) = exp(-ΔE / T) for specific size increases.
+     * Since ΔE = (percent_increase / 100) * 100000 = percent_increase * 1000,
+     * +0.01% -> ΔE = 10.0
+     * +0.10% -> ΔE = 100.0
+     * +1.00% -> ΔE = 1000.0
+     */
+    double prob_0_01 = (T > 0.0) ? exp(-10.0 / T) : 0.0;
+    double prob_0_10 = (T > 0.0) ? exp(-100.0 / T) : 0.0;
+    double prob_1_00 = (T > 0.0) ? exp(-1000.0 / T) : 0.0;
+
+    fprintf(stderr, "Temperature: %.4f\n", T);
+    fprintf(stderr, "P(Accept) for Regressions     : +0.01%%: %5.2f%% | +0.1%%: %5.2f%% | +1%%: %5.2f%%\n", 
+            prob_0_01 * 100.0, prob_0_10 * 100.0, prob_1_00 * 100.0);
+            
     fprintf(stderr, "\nCurrent Remap Table Dump:\n");
     print_remap_table_as_source("current_remap", remap);
     fprintf(stderr, "========================================================================\n\n");
@@ -259,6 +276,7 @@ int main(int argc, char **argv) {
     double pending_elapsed = 0.0;
     size_t pending_new_size = 0;
     size_t pending_prev_size = 0;
+    double pending_T = 0.0; // Captures the exact Temperature at the time of improvement
 
     // SA Parameters
     double T_end = 0.1;
@@ -280,7 +298,7 @@ int main(int argc, char **argv) {
         if (has_pending_report && difftime(now, last_report_time) >= 5.0) {
             report_improvement(pending_remap, pending_iter, pending_elapsed, timeout, 
                                dict_param_kb, lc_param, lp_param, pb_param, 
-                               pending_new_size, pending_prev_size, initial_sum, baseline_sum);
+                               pending_new_size, pending_prev_size, initial_sum, baseline_sum, pending_T);
             last_report_time = now;
             has_pending_report = 0;
         }
@@ -318,12 +336,11 @@ int main(int argc, char **argv) {
         /**
          * Algorithm: Normalized Energy Delta Calculation
          * Evaluates the relative change in compressed size rather than absolute bytes.
-         * Energy E = (compressed_size / baseline_size) * 1000
+         * Energy E = (compressed_size / baseline_size) * 100000
          * By normalizing against the baseline size, the energy landscape becomes 
-         * invariant to the raw size of the input files, making the Temperature (T)
-         * scale highly reusable across different datasets.
+         * invariant to the raw size of the input files.
          */
-        double delta = (((double)test_sum - (double)current_sum) / safe_baseline) * 1000.0;
+        double delta = (((double)test_sum - (double)current_sum) / safe_baseline) * 100000.0;
 
         /**
          * Algorithm: Metropolis Acceptance Criterion
@@ -344,7 +361,7 @@ int main(int argc, char **argv) {
                 if (difftime(now, last_report_time) >= 5.0) {
                     report_improvement(test_remap, iterations, elapsed, timeout, 
                                        dict_param_kb, lc_param, lp_param, pb_param, 
-                                       test_sum, current_sum, initial_sum, baseline_sum);
+                                       test_sum, current_sum, initial_sum, baseline_sum, T);
                     last_report_time = now;
                     has_pending_report = 0; // Clear any stale flags
                 } else {
@@ -354,6 +371,7 @@ int main(int argc, char **argv) {
                     pending_elapsed = elapsed;
                     pending_new_size = test_sum;
                     pending_prev_size = current_sum;
+                    pending_T = T;
                     has_pending_report = 1;
                 }
             }
@@ -387,7 +405,7 @@ int main(int argc, char **argv) {
     if (has_pending_report) {
         report_improvement(pending_remap, pending_iter, pending_elapsed, timeout, 
                            dict_param_kb, lc_param, lp_param, pb_param, 
-                           pending_new_size, pending_prev_size, initial_sum, baseline_sum);
+                           pending_new_size, pending_prev_size, initial_sum, baseline_sum, pending_T);
     }
 
     fprintf(stderr, "/* Simulated Annealing Terminated. Iterations: %llu */\n", iterations);
