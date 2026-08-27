@@ -147,8 +147,8 @@ void report_improvement(const uint8_t *remap, unsigned long long iter, double el
     double prob_1_00 = (T > 0.0) ? exp(-1000.0 / T) : 0.0;
 
     fprintf(stderr, "Temperature: %.4f\n", T);
-    fprintf(stderr, "P(Accept) for Regressions     : +0.01%%: %5.2f%% | +0.1%%: %5.2f%% | +1%%: %5.2f%%\n", 
-            prob_0_01 * 100.0, prob_0_10 * 100.0, prob_1_00 * 100.0);
+    fprintf(stderr, "P(Accept) for Regressions     : +0.01%%: %.8f | +0.1%%: %.8f | +1%%: %.8f\n", 
+            prob_0_01, prob_0_10, prob_1_00);
             
     fprintf(stderr, "\nCurrent Remap Table Dump:\n");
     print_remap_table_as_source("current_remap", remap);
