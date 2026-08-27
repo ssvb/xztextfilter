@@ -24,4 +24,4 @@ jobs:
 
       - name: Run Simulated Annealing (~5.5 Hours)
         run: |
-          ./lzma_remap_sa_multi --lc=1 --lp=0 --pb=0 --heuristic --swaps=1024 --stagnation=1000 --timeout=20000 small/texteng.txt small/texteng.html
+          ./lzma_remap_sa_multi --lc=1 --lp=0 --pb=0 --reshuffle --autonormalize --swaps=1024 --stagnation=1000 --timeout=20000 small/texteng.txt small/texteng.html

@@ -37,8 +37,10 @@
  * 
  * 5. Variable Neighborhood Search (Multi-Swap Algorithm)
  *    - Starts by applying N (default: 256) random pair swaps simultaneously.
- *    - If '--normalize' is active, swaps are ONLY valid if elements belong to 
+ *    - If '--fullnormalize' is active, swaps are ONLY valid if elements belong to 
  *      different chunks. Otherwise, global swaps are permitted.
+ *    - If '--autonormalize' is active, it opportunistically checks if normalizing
+ *      a random permutation further reduces the file size, keeping it only if true.
  *    - If no improvement is found after K (default: 1000) iterations, the search 
  *      space is narrowed by halving N (simulated annealing).
  * 
@@ -113,7 +115,8 @@ void print_help(const char *prog_name) {
     printf("  --reshuffle       Randomize the initial remap table (stagnation times) to pick the best seed.\n");
     printf("  --seedfile=FILE   Load the seed remap from an external file.\n");
     printf("  --heuristic       Run exhaustive 8-bit permutation heuristic (40,320 evals).\n");
-    printf("  --normalize       Enable normalization (sorting) of the remap tables (disabled by default).\n");
+    printf("  --fullnormalize   Enable unconditional normalization (sorting) of the remap tables.\n");
+    printf("  --autonormalize   Opportunistically apply normalization if it reduces compression size.\n");
     printf("  --swaps=N         Initial number of simultaneous pair swaps (default: 256).\n");
     printf("  --stagnation=K    Iterations without improvement before halving swaps (default: 1000).\n");
     printf("  --dict=KB         Set LZMA dictionary size in kilobytes (default: 4).\n");
@@ -445,7 +448,7 @@ void normalize_remap(uint8_t *remap, int lc) {
  * starting permutation. This establishes a significantly stronger initial 
  * seed vector for the VNS algorithm, minimizing early search iterations.
  */
-void generate_best_reshuffled_remap(uint8_t *out_remap, const uint8_t *base_remap, int stagnation_limit, int do_norm,
+void generate_best_reshuffled_remap(uint8_t *out_remap, const uint8_t *base_remap, int stagnation_limit, int do_fullnorm, int do_autonorm,
                                     int file_count, FileData *files, uint8_t *remapped_buf, uint8_t *out_buf,
                                     size_t out_capacity, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
     size_t best_size = SIZE_MAX;
@@ -461,12 +464,31 @@ void generate_best_reshuffled_remap(uint8_t *out_remap, const uint8_t *base_rema
             test_remap[j] = tmp;
         }
         
-        // Maintain architectural continuity if chunk alignment is required
-        if (do_norm) normalize_remap(test_remap, lc_param);
+        // Maintain architectural continuity if chunk alignment is unconditionally required
+        if (do_fullnorm) normalize_remap(test_remap, lc_param);
         
         // Fast baseline evaluation allows us to parse through thousands of seeds
         size_t s = evaluate_remap(test_remap, file_count, files, remapped_buf, out_buf, out_capacity, 
                                   dict_param_kb, lc_param, lp_param, pb_param, best_size, NULL);
+        
+        // Algorithm: Opportunistic Auto-Normalization
+        // Independently evaluate a chunk-normalized variant of the shuffled table.
+        // We set the threshold to the most optimal known size (s vs best_size) to 
+        // aggressively abort the normalization test if it isn't an absolute improvement.
+        if (do_autonorm && !do_fullnorm) {
+            uint8_t norm_remap[256];
+            memcpy(norm_remap, test_remap, 256);
+            normalize_remap(norm_remap, lc_param);
+            
+            size_t threshold = (s < best_size) ? s : best_size;
+            size_t s_norm = evaluate_remap(norm_remap, file_count, files, remapped_buf, out_buf, out_capacity, 
+                                           dict_param_kb, lc_param, lp_param, pb_param, threshold, NULL);
+            if (s_norm < threshold) {
+                s = s_norm;
+                memcpy(test_remap, norm_remap, 256);
+            }
+        }
+
         if (s < best_size) {
             best_size = s;
             memcpy(out_remap, test_remap, 256);
@@ -545,7 +567,7 @@ int main(int argc, char **argv) {
     int timeout = 600; 
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
     int do_reshuffle = 0, do_heuristic = 0;
-    int do_normalize = 0;
+    int do_fullnormalize = 0, do_autonormalize = 0;
     const char *seedfile_path = NULL;
     
     // Parameters for Variable Neighborhood Search
@@ -561,7 +583,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--reshuffle") == 0) do_reshuffle = 1;
         else if (strncmp(argv[i], "--seedfile=", 11) == 0) seedfile_path = argv[i] + 11;
         else if (strcmp(argv[i], "--heuristic") == 0) do_heuristic = 1;
-        else if (strcmp(argv[i], "--normalize") == 0) do_normalize = 1;
+        else if (strcmp(argv[i], "--fullnormalize") == 0) do_fullnormalize = 1;
+        else if (strcmp(argv[i], "--autonormalize") == 0) do_autonormalize = 1;
         else if (strncmp(argv[i], "--swaps=", 8) == 0) initial_swaps = atoi(argv[i] + 8);
         else if (strncmp(argv[i], "--stagnation=", 13) == 0) max_stagnation = atoi(argv[i] + 13);
         else if (strncmp(argv[i], "--dict=", 7) == 0) dict_param_kb = atoi(argv[i] + 7);
@@ -642,13 +665,28 @@ int main(int argc, char **argv) {
         memcpy(current_remap, ctx.best_remap, 256);
     } else if (do_reshuffle) {
         fprintf(stderr, "/* Starting Multi-Reshuffle Selection (%d evaluations) */\n", max_stagnation);
-        generate_best_reshuffled_remap(current_remap, seed_remap, max_stagnation, do_normalize,
+        generate_best_reshuffled_remap(current_remap, seed_remap, max_stagnation, do_fullnormalize, do_autonormalize,
                                        file_count, files, remapped_buf, out_buf, out_capacity,
                                        dict_param_kb, lc_param, lp_param, pb_param);
         fprintf(stderr, "/* Multi-Reshuffle Selection Complete. Optimal starting seed selected. */\n\n");
     }
 
-    if (do_normalize) normalize_remap(current_remap, lc_param);
+    if (do_fullnormalize) {
+        normalize_remap(current_remap, lc_param);
+    } else if (do_autonormalize) {
+        /* Algorithm: Initial Opportunistic Normalization
+         * Check if statically normalizing the initial seed provides an immediate
+         * baseline compression size reduction. 
+         */
+        uint8_t norm_test[256];
+        memcpy(norm_test, current_remap, 256);
+        normalize_remap(norm_test, lc_param);
+        size_t base_s = evaluate_remap(current_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, 0, NULL);
+        size_t norm_s = evaluate_remap(norm_test, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, base_s, NULL);
+        if (norm_s < base_s) {
+            memcpy(current_remap, norm_test, 256);
+        }
+    }
     
     // Save the finalized Initial Seed
     uint8_t loop_start_remap[256];
@@ -709,10 +747,10 @@ int main(int argc, char **argv) {
                     
                     /**
                      * Algorithm: Chunk Compatibility
-                     * Evaluates if we are in normalize mode. If so, swaps are ONLY 
+                     * Evaluates if we are in full normalize mode. If so, swaps are ONLY 
                      * valid if the elements belong to different LZMA chunks.
                      */
-                    if (do_normalize && ((a / chunk_size) == (b / chunk_size))) continue;
+                    if (do_fullnormalize && ((a / chunk_size) == (b / chunk_size))) continue;
                     
                     int min_idx = a < b ? a : b;
                     int max_idx = a > b ? a : b;
@@ -737,16 +775,41 @@ int main(int argc, char **argv) {
                     int a = rand() % 256, b;
                     do { 
                         b = rand() % 256; 
-                    } while (a == b || (do_normalize && ((a / chunk_size) == (b / chunk_size))));
+                    } while (a == b || (do_fullnormalize && ((a / chunk_size) == (b / chunk_size))));
                     uint8_t tmp = test_remap[a]; test_remap[a] = test_remap[b]; test_remap[b] = tmp;
                 }
             }
             
-            if (do_normalize) normalize_remap(test_remap, lc_param);
+            if (do_fullnormalize) normalize_remap(test_remap, lc_param);
             
             size_t *local_file_sizes = malloc(file_count * sizeof(size_t));
             size_t test_sum = evaluate_remap(test_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, current_sum, local_file_sizes);
             
+            /* Algorithm: Opportunistic Auto-Normalization (Random Swaps)
+             * Evaluates if enforcing chunk normalization on the newly swapped 
+             * permutation yields a further reduction in compressed size. If so,
+             * we unconditionally accept the normalized state as our candidate.
+             * 
+             * Optimization: The abort_threshold dynamically leverages the best
+             * known size (either the un-normalized test_sum or current_sum).
+             */
+            if (do_autonormalize && !do_fullnormalize) {
+                uint8_t norm_remap[256];
+                memcpy(norm_remap, test_remap, 256);
+                normalize_remap(norm_remap, lc_param);
+                
+                size_t *norm_file_sizes = malloc(file_count * sizeof(size_t));
+                size_t threshold = (test_sum < current_sum) ? test_sum : current_sum;
+                size_t norm_sum = evaluate_remap(norm_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, threshold, norm_file_sizes);
+                
+                if (norm_sum < threshold) {
+                    test_sum = norm_sum;
+                    memcpy(test_remap, norm_remap, 256);
+                    memcpy(local_file_sizes, norm_file_sizes, file_count * sizeof(size_t));
+                }
+                free(norm_file_sizes);
+            }
+
             if (test_sum < current_sum) {
                 int is_global = (test_sum < best_sum);
                 
@@ -789,7 +852,7 @@ int main(int argc, char **argv) {
             
             for (int i = 0; i < 256 && !found_improvement && difftime(time(NULL), start_time) < timeout; i++) {
                 for (int j = i + 1; j < 256; j++) {
-                    if (do_normalize && ((i / chunk_size) == (j / chunk_size))) continue;
+                    if (do_fullnormalize && ((i / chunk_size) == (j / chunk_size))) continue;
                     
                     // Pruning phase utilizes bit array established during random swaps
                     if (tested_pairs[i][j >> 3] & (1 << (j & 7))) continue;
@@ -798,11 +861,32 @@ int main(int argc, char **argv) {
                     uint8_t test_remap[256];
                     memcpy(test_remap, current_remap, 256);
                     uint8_t tmp = test_remap[i]; test_remap[i] = test_remap[j]; test_remap[j] = tmp;
-                    if (do_normalize) normalize_remap(test_remap, lc_param);
+                    if (do_fullnormalize) normalize_remap(test_remap, lc_param);
                     
                     size_t *local_file_sizes = malloc(file_count * sizeof(size_t));
                     size_t test_sum = evaluate_remap(test_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, best_thorough_sum, local_file_sizes);
                     
+                    /* Algorithm: Opportunistic Auto-Normalization (Thorough Pass)
+                     * Systematically tries chunk normalization after every single pair swap
+                     * to greedily seek any edge-case improvements missed by standard evaluation.
+                     */
+                    if (do_autonormalize && !do_fullnormalize) {
+                        uint8_t norm_remap[256];
+                        memcpy(norm_remap, test_remap, 256);
+                        normalize_remap(norm_remap, lc_param);
+                        
+                        size_t *norm_file_sizes = malloc(file_count * sizeof(size_t));
+                        size_t threshold = (test_sum < best_thorough_sum) ? test_sum : best_thorough_sum;
+                        size_t norm_sum = evaluate_remap(norm_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param, threshold, norm_file_sizes);
+                        
+                        if (norm_sum < threshold) {
+                            test_sum = norm_sum;
+                            memcpy(test_remap, norm_remap, 256);
+                            memcpy(local_file_sizes, norm_file_sizes, file_count * sizeof(size_t));
+                        }
+                        free(norm_file_sizes);
+                    }
+
                     if (test_sum < best_thorough_sum) {
                         best_thorough_sum = test_sum;
                         memcpy(best_thorough_remap, test_remap, 256);
@@ -846,13 +930,13 @@ int main(int argc, char **argv) {
                 // Revert to start or random baseline
                 if (do_reshuffle) {
                     fprintf(stderr, "/* Multi-Reshuffle: Selecting new random baseline (%d iterations)... */\n", max_stagnation);
-                    generate_best_reshuffled_remap(current_remap, seed_remap, max_stagnation, do_normalize,
+                    generate_best_reshuffled_remap(current_remap, seed_remap, max_stagnation, do_fullnormalize, do_autonormalize,
                                                    file_count, files, remapped_buf, out_buf, out_capacity,
                                                    dict_param_kb, lc_param, lp_param, pb_param);
                 } else {
                     memcpy(current_remap, loop_start_remap, 256);
                 }
-                if (do_normalize) normalize_remap(current_remap, lc_param);
+                if (do_fullnormalize) normalize_remap(current_remap, lc_param);
                 
                 // CRITICAL: We must re-evaluate the reset state and update the file sizes 
                 // so the "vs Previous" reporting starts fresh from the new baseline peak.
