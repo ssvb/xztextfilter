@@ -25,24 +25,31 @@
  *    - When '--heuristic' is active, the system generates all 40,320 (8!) 
  *      possible remaps derived from swapping bits within a byte of the identity 
  *      remap using Heap's Algorithm.
- *    - Each candidate is rigorously evaluated using LZMA Extreme (Preset 6, 8MB dict).
+ *    - Each candidate is rigorously evaluated using standard LZMA parameters
+ *      (cmdline configured dict/lc/lp/pb).
  *    - The best permutation anchors the starting state for the multi-swap phase.
  * 
- * 4. Variable Neighborhood Search (Multi-Swap Algorithm)
+ * 4. Multi-Shuffle Seed Selection
+ *    - When '--reshuffle' is active, the system generates N (stagnation) fully 
+ *      randomized permutations rather than just one. 
+ *    - The single permutation that compresses the baseline best is isolated and 
+ *      chosen as the starting seed, preventing wasted initial search cycles.
+ * 
+ * 5. Variable Neighborhood Search (Multi-Swap Algorithm)
  *    - Starts by applying N (default: 256) random pair swaps simultaneously.
  *    - If '--normalize' is active, swaps are ONLY valid if elements belong to 
  *      different chunks. Otherwise, global swaps are permitted.
  *    - If no improvement is found after K (default: 1000) iterations, the search 
  *      space is narrowed by halving N (simulated annealing).
  * 
- * 5. N=1 Optimization and Tested Pair Tracking (Bit Array Collision Avoidance)
+ * 6. N=1 Optimization and Tested Pair Tracking (Bit Array Collision Avoidance)
  *    - When N drops to 1, a bit array (tested_pairs) is utilized to memorize 
  *      the previously checked swap combinations.
  *    - Random swaps query this array to immediately skip already-tested pairs. 
  *    - If the random generator encounters too many tested pairs (dense space), 
  *      the system preemptively breaks into Exhaustive Thorough mode.
  * 
- * 6. Exhaustive "Thorough" Fallback and Candidate Archiving
+ * 7. Exhaustive "Thorough" Fallback and Candidate Archiving
  *    - Systematically tests EVERY possible valid pair. It consults the same 
  *      bit array to skip previously evaluated pairs, vastly accelerating the pass.
  *    - If an improvement is found, it greedily applies it, wipes the bit array 
@@ -51,12 +58,12 @@
  *      confirmed. The table is archived as a "Result Candidate", the bit array 
  *      is reset, and a new search path begins.
  * 
- * 7. Final Evaluation and Winner Selection
+ * 8. Final Evaluation and Winner Selection
  *    - Evaluates LZMA2 Preset 6 (Extreme, 8MB dict) for all archived candidates 
  *      and the final unfinished remap.
  *    - Sorts all candidates based on their total compressed size.
  * 
- * 8. Result Persistence & Seed Evolution
+ * 9. Result Persistence & Seed Evolution
  *    - If the final extreme evaluation determines the absolute best candidate 
  *      surpasses the initial loaded seed, the system physically patches the 
  *      original seed file, substituting the new permutation under a '.new' file.
@@ -103,7 +110,7 @@ void print_help(const char *prog_name) {
     printf("Options:\n");
     printf("  --help            Show this help message and exit.\n");
     printf("  --timeout=SEC     Set timeout in seconds (default: 600).\n");
-    printf("  --reshuffle       Randomize the initial remap table before starting.\n");
+    printf("  --reshuffle       Randomize the initial remap table (stagnation times) to pick the best seed.\n");
     printf("  --seedfile=FILE   Load the seed remap from an external file.\n");
     printf("  --heuristic       Run exhaustive 8-bit permutation heuristic (40,320 evals).\n");
     printf("  --normalize       Enable normalization (sorting) of the remap tables (disabled by default).\n");
@@ -424,6 +431,50 @@ void normalize_remap(uint8_t *remap, int lc) {
 }
 
 // ------------------------------------------------------------------------------------------
+// Multi-Shuffle Seed Generator
+// ------------------------------------------------------------------------------------------
+
+/**
+ * ==============================================================================
+ * Algorithm: Multi-Shuffle Seed Selection
+ * ==============================================================================
+ * Instead of relying on a single random permutation, this function generates 
+ * 'stagnation_limit' independent random shuffles using the Fisher-Yates algorithm.
+ * Each candidate is rapidly evaluated using the baseline LZMA configuration.
+ * By tracking the minimum compressed size, it returns the statistically optimal 
+ * starting permutation. This establishes a significantly stronger initial 
+ * seed vector for the VNS algorithm, minimizing early search iterations.
+ */
+void generate_best_reshuffled_remap(uint8_t *out_remap, const uint8_t *base_remap, int stagnation_limit, int do_norm,
+                                    int file_count, FileData *files, uint8_t *remapped_buf, uint8_t *out_buf,
+                                    size_t out_capacity, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
+    size_t best_size = SIZE_MAX;
+    for (int iter = 0; iter < stagnation_limit; iter++) {
+        uint8_t test_remap[256];
+        memcpy(test_remap, base_remap, 256);
+        
+        // Algorithm: Fisher-Yates shuffle guarantees an unbiased random distribution
+        for (int i = 255; i > 0; i--) {
+            int j = rand() % (i + 1);
+            uint8_t tmp = test_remap[i]; 
+            test_remap[i] = test_remap[j]; 
+            test_remap[j] = tmp;
+        }
+        
+        // Maintain architectural continuity if chunk alignment is required
+        if (do_norm) normalize_remap(test_remap, lc_param);
+        
+        // Fast baseline evaluation allows us to parse through thousands of seeds
+        size_t s = evaluate_remap(test_remap, file_count, files, remapped_buf, out_buf, out_capacity, 
+                                  dict_param_kb, lc_param, lp_param, pb_param, best_size, NULL);
+        if (s < best_size) {
+            best_size = s;
+            memcpy(out_remap, test_remap, 256);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------
 // Bit-Permutation Heuristic Evaluator
 // ------------------------------------------------------------------------------------------
 typedef struct {
@@ -435,6 +486,7 @@ typedef struct {
     uint8_t *remapped_buf;
     uint8_t *out_buf;
     size_t out_capacity;
+    int dict_param_kb; // Added capability to inherit standard dict size
     int lc, lp, pb;
     unsigned long long count;
 } HeuristicBitCtx;
@@ -444,7 +496,7 @@ typedef struct {
  * Iteratively constructs every unique permutation of an 8-element set (40,320 combinations).
  * For each layout, it fabricates a full 256-byte translation table where every byte 
  * has its individual bits strictly reordered according to the active permutation.
- * Evaluates candidates aggressively via LZMA Extreme 6 preset.
+ * Evaluates candidates using the standard cmdline configured LZMA settings.
  */
 void generate_bit_permutations(int k, int *perm, HeuristicBitCtx *ctx) {
     if (k == 1) {
@@ -459,15 +511,12 @@ void generate_bit_permutations(int k, int *perm, HeuristicBitCtx *ctx) {
             test_remap[i] = mapped;
         }
 
-        size_t total_size = 0;
-        for (int f = 0; f < ctx->file_count; f++) {
-            // Mandated evaluation constraints: Extreme LZMA 6 preset utilizing 8MB Dictionary
-            size_t s = evaluate_extreme(test_remap, ctx->files[f].file_size, ctx->files[f].in_buf, 
-                                        ctx->remapped_buf, ctx->out_buf, ctx->out_capacity, 
-                                        ctx->lc, ctx->lp, ctx->pb);
-            total_size += s;
-            if (total_size >= ctx->best_size) break; 
-        }
+        // Algorithm: Fast evaluation utilizing cmdline-configured standard compression 
+        // and dictionary size. Aborts early if running total exceeds ctx->best_size.
+        size_t total_size = evaluate_remap(test_remap, ctx->file_count, ctx->files,
+                                           ctx->remapped_buf, ctx->out_buf, ctx->out_capacity,
+                                           ctx->dict_param_kb, ctx->lc, ctx->lp, ctx->pb,
+                                           ctx->best_size, NULL);
 
         if (total_size < ctx->best_size) {
             ctx->best_size = total_size;
@@ -575,6 +624,7 @@ int main(int argc, char **argv) {
             .file_count = file_count, .files = files, 
             .remapped_buf = remapped_buf, .out_buf = out_buf, 
             .out_capacity = out_capacity, 
+            .dict_param_kb = dict_param_kb,
             .lc = lc_param, .lp = lp_param, .pb = pb_param, 
             .count = 0 
         };
@@ -591,9 +641,11 @@ int main(int argc, char **argv) {
         
         memcpy(current_remap, ctx.best_remap, 256);
     } else if (do_reshuffle) {
-        for (int i = 255; i > 0; i--) {
-            int j = rand() % (i + 1); uint8_t temp = current_remap[i]; current_remap[i] = current_remap[j]; current_remap[j] = temp;
-        }
+        fprintf(stderr, "/* Starting Multi-Reshuffle Selection (%d evaluations) */\n", max_stagnation);
+        generate_best_reshuffled_remap(current_remap, seed_remap, max_stagnation, do_normalize,
+                                       file_count, files, remapped_buf, out_buf, out_capacity,
+                                       dict_param_kb, lc_param, lp_param, pb_param);
+        fprintf(stderr, "/* Multi-Reshuffle Selection Complete. Optimal starting seed selected. */\n\n");
     }
 
     if (do_normalize) normalize_remap(current_remap, lc_param);
@@ -793,10 +845,10 @@ int main(int argc, char **argv) {
                 
                 // Revert to start or random baseline
                 if (do_reshuffle) {
-                    for (int i = 0; i < 256; i++) current_remap[i] = seed_remap[i]; 
-                    for (int i = 255; i > 0; i--) {
-                        int j = rand() % (i + 1); uint8_t tmp = current_remap[i]; current_remap[i] = current_remap[j]; current_remap[j] = tmp;
-                    }
+                    fprintf(stderr, "/* Multi-Reshuffle: Selecting new random baseline (%d iterations)... */\n", max_stagnation);
+                    generate_best_reshuffled_remap(current_remap, seed_remap, max_stagnation, do_normalize,
+                                                   file_count, files, remapped_buf, out_buf, out_capacity,
+                                                   dict_param_kb, lc_param, lp_param, pb_param);
                 } else {
                     memcpy(current_remap, loop_start_remap, 256);
                 }
