@@ -1,4 +1,4 @@
-name: LZMA2 lc=3,lp=0,pb=2
+name: LZMA2 lc=3,lp=0,pb=0
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch: # Allows manual triggering from the UI
 
 jobs:
-  find-new-remap-302:
+  find-new-sa-302:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,8 +20,8 @@ jobs:
 
       - name: Compile Optimizer
         run: |
-          gcc -O3 -o lzma_remap_sa_multi lzma_remap_sa_multi.c -llzma -lm
+          gcc -O3 -o true_sa true_sa.c -llzma -lm
 
       - name: Run Simulated Annealing (~5.5 Hours)
         run: |
-          ./lzma_remap_sa_multi --lc=3 --lp=0 --pb=2 --reshuffle --autonormalize --swaps=1024 --stagnation=1000 --timeout=20000 small/texteng.txt small/texteng.html
+          ./true_sa --lc=3 --lp=0 --pb=0 --tstart=20 --timeout=20000 small/texteng.txt small/texteng.html

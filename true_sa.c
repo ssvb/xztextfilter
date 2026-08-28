@@ -8,26 +8,22 @@
 
 /**
  * ==============================================================================
- * ALGORITHM OVERVIEW: Textbook Simulated Annealing
+ * ALGORITHM OVERVIEW: Simulated Annealing with Greedy Refinement
  * ==============================================================================
  * 
  * 1. Frequency Analysis & Victim Selection
- *    - Scans all input files to tally the occurrences of every byte value (0-255).
- *    - Identifies the "Victim Index", which is the byte value with the absolute
- *      lowest global frequency. This byte's mapping will be aggressively 
- *      targeted during the search to limit catastrophic disruption of highly 
- *      frequent bytes.
+ *    - Scans all input files to tally occurrences of every byte value (0-255).
+ *    - Identifies the "Victim Index" (lowest frequency byte), making it the 
+ *      focal point for continuous remapping swaps.
  * 
  * 2. State Initialization
- *    - Establishes a true Baseline using the Identity Mapping (0->0, 1->1...).
- *    - Randomly reshuffles the identity mapping using the Fisher-Yates algorithm
- *      to create the chaotic Initial State for the annealing process.
+ *    - Establishes a true Baseline using the Identity Mapping.
+ *    - Randomly reshuffles the identity mapping (Fisher-Yates) for the Initial State.
  * 
- * 3. Textbook Simulated Annealing (Exponential Cooling)
- *    - Evaluates random neighbor states by swapping the remap table element at
- *      the Victim Index with another element at a random index.
- *    - Uses a deterministic Exponential Cooling Schedule based on the execution
- *      timeout parameter to slowly lower the "Temperature" (T) over time.
+ * 3. Simulated Annealing Phase
+ *    - Exponential Cooling Schedule lowers Temperature (T) over the timeout.
+ *    - Evaluates random swaps at the victim index using the Metropolis 
+ *      Acceptance Criterion. Normalized energy uses a 100,000x multiplier.
  * 
  * 4. Metropolis Acceptance Criterion
  *    - Uses a normalized Energy scale E = (size / baseline_size) * 100000.
@@ -35,6 +31,19 @@
  *      unconditionally accepted.
  *    - If a swap INCREASES the energy (ΔE > 0), it is probabilistically
  *      accepted using the Boltzmann distribution: P(accept) = exp(-ΔE / T).
+ *
+ * 5. Post-Annealing Greedy Refinement
+ *    - Iterates 0-255, swapping the victim index with each candidate.
+ *    - Configurable Search Depth (--greedy-depth): Can evaluate sequences
+ *      of multiple swaps recursively to escape shallow local minima.
+ *    - Adopts *only* strict size improvements.
+ *    - Repeats full 256-element passes until a local optimum is confirmed
+ *      (zero improvements in a single pass).
+ * 
+ * 6. Final Extreme Evaluation
+ *    - Benchmarks the absolute best mapping found against the identity mapping
+ *      using the LZMA2 "6e" preset, an 8MB dictionary, and the user-specified
+ *      context parameters (lc, lp, pb) for maximum compression.
  * ==============================================================================
  */
 
@@ -47,46 +56,48 @@ typedef struct {
 void print_help(const char *prog_name) {
     printf("Usage: %s [OPTIONS] <input_file_1> [input_file_2 ...]\n\n", prog_name);
     printf("Options:\n");
-    printf("  --help            Show this help message and exit.\n");
-    printf("  --timeout=SEC     Set timeout in seconds for annealing (default: 60).\n");
-    printf("  --tstart=FLOAT    Set initial temperature for annealing (default: 5000.0).\n");
-    printf("  --dict=KB         Set LZMA dictionary size in kilobytes (default: 4).\n");
-    printf("  --lc=BITS         Set LZMA literal context bits (1-4, default: 3).\n");
-    printf("  --lp=BITS         Set LZMA literal position bits (0-4, default: 0).\n");
-    printf("  --pb=BITS         Set LZMA position bits (0-4, default: 2).\n");
+    printf("  --help               Show this help message and exit.\n");
+    printf("  --timeout=SEC        Set timeout in seconds for annealing (default: 60).\n");
+    printf("  --tstart=FLOAT       Set initial temperature for annealing (default: 20.0).\n");
+    printf("  --greedy-depth=NUM   Set search depth for greedy refinement (default: 1).\n");
+    printf("  --dict=KB            Set LZMA dictionary size in kilobytes (default: 4).\n");
+    printf("  --lc=BITS            Set LZMA literal context bits (1-4, default: 3).\n");
+    printf("  --lp=BITS            Set LZMA literal position bits (0-4, default: 0).\n");
+    printf("  --pb=BITS            Set LZMA position bits (0-4, default: 2).\n");
     printf("\n");
 }
 
 /**
  * Algorithm: LZMA Compression Wrapper
- * Sets up LZMA2 filters and compresses an in-memory buffer. 
- * Returns the output size or out_capacity + 1 if compression fails/exceeds limits.
+ * Utilizes lzma_lzma_preset to apply base settings, then conditionally overrides
+ * specific parameters (dict, lc, lp, pb). This allows for fast low-level evaluation 
+ * during search and extreme settings during final reporting.
  */
-size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
+size_t compress_buffer(const uint8_t *in_buf, size_t in_len, uint8_t *out_buf, size_t out_capacity, uint32_t preset, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
     lzma_options_lzma opt;
-    if (lzma_lzma_preset(&opt, 0)) return out_capacity + 1;
+    if (lzma_lzma_preset(&opt, preset)) return out_capacity + 1;
+    
+    // Explicit overrides for the active options
     opt.dict_size = ((uint32_t)dict_param_kb * 1024 < LZMA_DICT_SIZE_MIN) ? LZMA_DICT_SIZE_MIN : (uint32_t)dict_param_kb * 1024; 
-    opt.lc = lc_param; opt.lp = lp_param; opt.pb = pb_param;                         
+    opt.lc = lc_param; 
+    opt.lp = lp_param; 
+    opt.pb = pb_param;                         
+    
     lzma_filter filters[2] = { { .id = LZMA_FILTER_LZMA2, .options = &opt }, { .id = LZMA_VLI_UNKNOWN, .options = NULL } };
     size_t out_pos = 0;
     lzma_ret ret = lzma_stream_buffer_encode(filters, LZMA_CHECK_CRC32, NULL, in_buf, in_len, out_buf, &out_pos, out_capacity);
     return (ret == LZMA_OK) ? out_pos : out_capacity + 1;
 }
 
-/**
- * Algorithm: Aggregate Evaluation
- * Applies the provided remap_table to all input files and calculates 
- * the total sum of their compressed sizes.
- */
 size_t evaluate_remap(const uint8_t *remap_table, int file_count, FileData *files, 
                       uint8_t *remapped_buf, uint8_t *out_buf, size_t out_capacity, 
-                      int dict, int lc, int lp, int pb) {
+                      uint32_t preset, int dict, int lc, int lp, int pb) {
     size_t total = 0;
     for (int i = 0; i < file_count; i++) {
         for (size_t j = 0; j < files[i].file_size; j++) {
             remapped_buf[j] = remap_table[files[i].in_buf[j]];
         }
-        total += compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, dict, lc, lp, pb);
+        total += compress_buffer(remapped_buf, files[i].file_size, out_buf, out_capacity, preset, dict, lc, lp, pb);
     }
     return total;
 }
@@ -155,9 +166,77 @@ void report_improvement(const uint8_t *remap, unsigned long long iter, double el
     fprintf(stderr, "========================================================================\n\n");
 }
 
+/**
+ * Algorithm: Unified Recursive Multi-Depth Greedy Search
+ * Consolidates the optimization logic by evaluating both top-level directly
+ * and sequencing multiple swaps recursively. At the root level (depth 1), 
+ * it systematically sweeps all 256 indices, allowing it to capture multiple 
+ * localized improvements without breaking iteration. At deeper depths, 
+ * it returns immediately upon discovering any strict improvement to bubble 
+ * the optimized state back up the call stack, naturally preventing loop 
+ * duplication in main.
+ */
+int explore_swaps(uint8_t *test_remap, size_t *current_sum, int current_depth, int max_depth, 
+                  int victim_index, int file_count, FileData *files, 
+                  uint8_t *remapped_buf, uint8_t *out_buf, size_t out_capacity, 
+                  int dict_param_kb, int lc_param, int lp_param, int pb_param,
+                  unsigned long long pass_num) {
+    
+    if (current_depth > max_depth) return 0;
+    
+    int any_improvement = 0;
+
+    for (int i = 0; i < 256; i++) {
+        if (i == victim_index) continue;
+        
+        uint8_t next_remap[256];
+        memcpy(next_remap, test_remap, 256);
+        
+        // Apply the deeper candidate swap
+        uint8_t tmp = next_remap[victim_index];
+        next_remap[victim_index] = next_remap[i];
+        next_remap[i] = tmp;
+        
+        size_t test_sum = evaluate_remap(next_remap, file_count, files, remapped_buf, out_buf, out_capacity, 0, dict_param_kb, lc_param, lp_param, pb_param);
+        
+        // If this combination yields a strict improvement, capture it
+        if (test_sum < *current_sum) {
+            *current_sum = test_sum;
+            memcpy(test_remap, next_remap, 256); // Propagate the improved state back up
+            any_improvement = 1;
+            
+            if (current_depth == 1) {
+                fprintf(stderr, "Greedy Refinement: Pass %llu, swap with 0x%02X yielded new best size: %zu bytes\n", 
+                        pass_num, i, *current_sum);
+            } else {
+                return 1; // Bubble up immediately for deeper depths
+            }
+        }
+        // Otherwise, continue exploring down to max_depth
+        else if (current_depth < max_depth) {
+            if (explore_swaps(next_remap, current_sum, current_depth + 1, max_depth, victim_index, 
+                              file_count, files, remapped_buf, out_buf, out_capacity, 
+                              dict_param_kb, lc_param, lp_param, pb_param, pass_num)) {
+                
+                memcpy(test_remap, next_remap, 256);
+                any_improvement = 1;
+                
+                if (current_depth == 1) {
+                    fprintf(stderr, "Greedy Refinement: Pass %llu, multi-depth swap via 0x%02X yielded new best size: %zu bytes\n", 
+                            pass_num, i, *current_sum);
+                } else {
+                    return 1; // Bubble up immediately
+                }
+            }
+        }
+    }
+    return any_improvement;
+}
+
 int main(int argc, char **argv) {
     int timeout = 60;
-    double T_start = 5000.0; // Default initial temperature
+    double T_start = 20.0; // Default initial temperature
+    int greedy_depth = 1;  // Default greedy multi-swap depth
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
     
     const char **filenames = malloc(argc * sizeof(char*));
@@ -172,6 +251,10 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { print_help(argv[0]); free(filenames); return EXIT_SUCCESS; }
         else if (strncmp(argv[i], "--timeout=", 10) == 0) timeout = atoi(argv[i] + 10);
         else if (strncmp(argv[i], "--tstart=", 9) == 0) T_start = atof(argv[i] + 9);
+        else if (strncmp(argv[i], "--greedy-depth=", 15) == 0) {
+            greedy_depth = atoi(argv[i] + 15);
+            if (greedy_depth < 1) greedy_depth = 1;
+        }
         else if (strncmp(argv[i], "--dict=", 7) == 0) dict_param_kb = atoi(argv[i] + 7);
         else if (strncmp(argv[i], "--lc=", 5) == 0) lc_param = atoi(argv[i] + 5);
         else if (strncmp(argv[i], "--lp=", 5) == 0) lp_param = atoi(argv[i] + 5);
@@ -226,12 +309,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Evaluate Identity (Baseline) Mapping
     uint8_t identity_remap[256];
     for (int i = 0; i < 256; i++) identity_remap[i] = i;
-    size_t baseline_sum = evaluate_remap(identity_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
     
-    // Prevent division by zero during energy normalization if baseline is somehow 0
+    // Evaluate Baseline using fast preset 0
+    size_t baseline_sum = evaluate_remap(identity_remap, file_count, files, remapped_buf, out_buf, out_capacity, 0, dict_param_kb, lc_param, lp_param, pb_param);
     double safe_baseline = baseline_sum > 0 ? (double)baseline_sum : 1.0;
 
     /**
@@ -248,7 +330,7 @@ int main(int argc, char **argv) {
         current_remap[j] = tmp;
     }
     
-    size_t initial_sum = evaluate_remap(current_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
+    size_t initial_sum = evaluate_remap(current_remap, file_count, files, remapped_buf, out_buf, out_capacity, 0, dict_param_kb, lc_param, lp_param, pb_param);
     size_t current_sum = initial_sum;
     size_t best_sum = initial_sum;
     
@@ -330,8 +412,8 @@ int main(int argc, char **argv) {
         test_remap[victim_index] = test_remap[swap_idx];
         test_remap[swap_idx] = tmp;
 
-        // Evaluate the neighbor state
-        size_t test_sum = evaluate_remap(test_remap, file_count, files, remapped_buf, out_buf, out_capacity, dict_param_kb, lc_param, lp_param, pb_param);
+        // Evaluate the neighbor state using preset 0 for fast search
+        size_t test_sum = evaluate_remap(test_remap, file_count, files, remapped_buf, out_buf, out_capacity, 0, dict_param_kb, lc_param, lp_param, pb_param);
 
         /**
          * Algorithm: Normalized Energy Delta Calculation
@@ -348,7 +430,6 @@ int main(int argc, char **argv) {
          */
         if (delta <= 0.0) {
             // ACCEPT: Decrease (or no change) in energy
-            
             if (delta < 0.0) { // Strictly smaller means an improvement worth reporting
                 
                 /**
@@ -363,7 +444,7 @@ int main(int argc, char **argv) {
                                        dict_param_kb, lc_param, lp_param, pb_param, 
                                        test_sum, current_sum, initial_sum, baseline_sum, T);
                     last_report_time = now;
-                    has_pending_report = 0; // Clear any stale flags
+                    has_pending_report = 0;
                 } else {
                     // Cache the current snapshot into the pending queue
                     memcpy(pending_remap, test_remap, 256);
@@ -409,7 +490,78 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "/* Simulated Annealing Terminated. Iterations: %llu */\n", iterations);
-    fprintf(stderr, "/* Best Found Compressed Size: %zu bytes */\n\n", best_sum);
+    fprintf(stderr, "/* Best Found Compressed Size (Fast Settings): %zu bytes */\n\n", best_sum);
+
+    // =========================================================
+    // POST-ANNEALING GREEDY REFINEMENT
+    // =========================================================
+    /**
+     * Algorithm: Hill-Climbing Search (Unified)
+     * Exploits the best SA state by continuously looping through discrete swaps 
+     * involving the victim index. By utilizing explore_swaps directly starting at 
+     * depth 1, we cleanly process the entire 0-255 index array without duplicating 
+     * any iteration logic. It continues performing full recursive cycles until 
+     * an entire pass confirms no further optimizations exist.
+     */
+    fprintf(stderr, "/* Starting Post-Annealing Greedy Refinement (Depth: %d) ... */\n", greedy_depth);
+    
+    // Seed the search with the absolute best SA mapping
+    memcpy(current_remap, best_remap, 256);
+    current_sum = best_sum;
+    int improvement_found;
+    unsigned long long refinement_iters = 0;
+
+    do {
+        refinement_iters++;
+        
+        // Single unified entry point covering both top-level passes and multi-depth explorations
+        improvement_found = explore_swaps(current_remap, &current_sum, 1, greedy_depth, victim_index, 
+                                          file_count, files, remapped_buf, out_buf, out_capacity, 
+                                          dict_param_kb, lc_param, lp_param, pb_param, refinement_iters);
+        
+        if (improvement_found) {
+            // Track global best securely to handle improvements from deep swaps
+            if (current_sum < best_sum) {
+                best_sum = current_sum;
+                memcpy(best_remap, current_remap, 256);
+            }
+        }
+        
+    } while (improvement_found);
+
+    fprintf(stderr, "/* Greedy Refinement Terminated after %llu full passes. */\n", refinement_iters);
+    fprintf(stderr, "/* Refined Compressed Size (Fast Settings): %zu bytes */\n\n", best_sum);
+
+    // =========================================================
+    // FINAL EVALUATION (Extreme Settings)
+    // =========================================================
+    /**
+     * Algorithm: Absolute Performance Benchmarking
+     * Pushes the optimized remap table through a high-cost LZMA compression sequence.
+     * Uses preset "6e" (6 | LZMA_PRESET_EXTREME) and an 8MB dict size, while
+     * retaining the user-defined command-line overrides for lc, lp, and pb
+     * to ascertain the ultimate byte reduction capabilities of the refined 
+     * entropy model versus the unmodified baseline.
+     */
+    fprintf(stderr, "========================================================================\n");
+    fprintf(stderr, "FINAL EVALUATION (Preset: 6e, Dictionary: 8MB)\n");
+    fprintf(stderr, "========================================================================\n");
+    
+    uint32_t final_preset = 6 | LZMA_PRESET_EXTREME;
+    int final_dict_kb = 8192; // 8MB
+
+    // Because we're passing the base parameters in explicitly, we apply the user-defined lc_param, lp_param, and pb_param
+    size_t final_baseline = evaluate_remap(identity_remap, file_count, files, remapped_buf, out_buf, out_capacity, final_preset, final_dict_kb, lc_param, lp_param, pb_param);
+    size_t final_best = evaluate_remap(best_remap, file_count, files, remapped_buf, out_buf, out_capacity, final_preset, final_dict_kb, lc_param, lp_param, pb_param);
+    
+    double final_pct = final_baseline ? ((double)((long long)final_best - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
+
+    fprintf(stderr, "Identity Remap Size : %zu bytes\n", final_baseline);
+    fprintf(stderr, "Best Remap Size     : %zu bytes\n", final_best);
+    fprintf(stderr, "Total Reduction     : %+10.3f%%\n\n", final_pct);
+    
+    print_remap_table_as_source("optimal_remap", best_remap);
+    fprintf(stderr, "========================================================================\n");
 
     // Memory Cleanup
     for (int i = 0; i < file_count; i++) free(files[i].in_buf);
