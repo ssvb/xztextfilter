@@ -1,0 +1,27 @@
+name: LZMA2 lc=3,lp=1,pb=1
+
+on:
+  push:
+    branches: [ "main", "remapfilter_v2" ]
+  workflow_dispatch: # Allows manual triggering from the UI
+
+jobs:
+  find-new-sa-311:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev gcc
+
+      - name: Compile Optimizer
+        run: |
+          g++ -O3 -std=c++20 -o true_sa true_sa.cpp -llzma -lm
+
+      - name: Run Simulated Annealing (~5.5 Hours)
+        run: |
+          ./true_sa --lc=3 --lp=1 --pb=1 --timeout=20000 small/texteng.txt small/texteng.html
