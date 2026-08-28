@@ -20,8 +20,8 @@ jobs:
 
       - name: Compile Optimizer
         run: |
-          gcc -O3 -o true_sa true_sa.c -llzma -lm
+          g++ -O3 -std=c++20 -o true_sa true_sa.cpp -llzma -lm
 
       - name: Run Simulated Annealing (~5.5 Hours)
         run: |
-          ./true_sa --lc=3 --lp=0 --pb=2 --tstart=20 --timeout=20000 small/texteng.txt small/texteng.html
+          ./true_sa --lc=3 --lp=0 --pb=2 --timeout=20000 small/texteng.txt small/texteng.html
