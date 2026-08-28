@@ -49,10 +49,14 @@
  * 
  * 5. Concurrent Greedy Refinement (Worker Thread)
  *    - Isolates greedy exploration into an asynchronous worker thread running 
- *      an unbounded Breadth-First Search (BFS).
- *    - Strictly follows paths where compressed size improves or stays equal (<=).
+ *      a Breadth-First Search (BFS) up to depth 7. Strictly follows paths where
+ *      compressed size improves or stays equal (<=).
+ *    - Tracks unique paths using a 64-bit integer state ID.
+ *    - Uses a 24-bit indexed bit array for depths <= 3, and a hash set for depths 4-7.
  *    - Dynamically resets its search space whenever the main Annealing thread 
  *      discovers a state better than the worker thread's current best.
+ *    - Restarts the BFS search with a new better root node even before
+ *      reaching depth 7 if an improvement is found within the greedy depth.
  * 
  * 6. Final Extreme Evaluation
  *    - Benchmarks the final SA best state and final Greedy best state against 
@@ -83,21 +87,14 @@ struct LZMAWorkspace {
 
 using RemapTable = std::array<uint8_t, 256>;
 
-// Custom hash for RemapTable to enable std::unordered_set deduplication in BFS
-struct RemapTableHash {
-    size_t operator()(const RemapTable& table) const noexcept {
-        std::string_view sv(reinterpret_cast<const char*>(table.data()), table.size());
-        return std::hash<std::string_view>{}(sv);
-    }
-};
-
 void print_help(const char* prog_name) {
     std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
     std::cout << "Usage: " << prog_name << " [OPTIONS] <input_file_1> [input_file_2 ...]\n\n"
               << "Options:\n"
               << "  --help               Show this help message and exit.\n"
-              << "  --timeout=SEC        Set timeout in seconds for annealing (default: 60).\n"
-              << "  --temperature=FLOAT  Set initial temperature for annealing (default: 30.0).\n"
+              << "  --timeout=SEC        Set timeout in seconds for annealing (default: 600).\n"
+              << "  --temperature=FLOAT  Set initial temperature for annealing (default: 50.0).\n"
+              << "  --bfs-depth=INT      Set initial max BFS depth for Greedy Refinement (default: 1).\n"
               << "  --dict=KB            Set LZMA dictionary size in kilobytes (default: 4).\n"
               << "  --lc=BITS            Set LZMA literal context bits (1-4, default: 3).\n"
               << "  --lp=BITS            Set LZMA literal position bits (0-4, default: 0).\n"
@@ -114,12 +111,12 @@ size_t compress_buffer(const uint8_t* in_buf, size_t in_len, uint8_t* out_buf, s
                         uint32_t preset, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
     lzma_options_lzma opt;
     if (lzma_lzma_preset(&opt, preset)) return out_capacity + 1;
-    
+
     opt.dict_size = ((uint32_t)dict_param_kb * 1024 < LZMA_DICT_SIZE_MIN) ? LZMA_DICT_SIZE_MIN : (uint32_t)dict_param_kb * 1024; 
     opt.lc = lc_param; 
     opt.lp = lp_param; 
-    opt.pb = pb_param;                         
-    
+    opt.pb = pb_param;
+
     lzma_filter filters[2] = { { LZMA_FILTER_LZMA2, &opt }, { LZMA_VLI_UNKNOWN, nullptr } };
     size_t out_pos = 0;
     lzma_ret ret = lzma_stream_buffer_encode(filters, LZMA_CHECK_CRC32, nullptr, in_buf, in_len, out_buf, &out_pos, out_capacity);
@@ -165,18 +162,18 @@ void report_improvement(const RemapTable& remap, unsigned long long iter, double
                         int dict, int lc, int lp, int pb,
                         size_t new_size, size_t prev_size, size_t initial_size, size_t baseline_size, double T) {
     std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-    
+
     double remaining = std::max(0.0, timeout - elapsed);
 
     fprintf(stderr, "========================================================================\n");
     fprintf(stderr, "ANNEALING IMPROVEMENT FOUND AT ITERATION %llu\n", iter);
     fprintf(stderr, "Time: %.1fs elapsed, %.1fs remaining\n", elapsed, remaining);
     fprintf(stderr, "LZMA Settings: dict=%dKB, lc=%d, lp=%d, pb=%d\n", dict, lc, lp, pb);
-    
+
     double pct_id = baseline_size ? ((double)((long long)new_size - (long long)baseline_size) / baseline_size) * 100.0 : 0.0;
     double pct_init = initial_size ? ((double)((long long)new_size - (long long)initial_size) / initial_size) * 100.0 : 0.0;
     double pct_prev = prev_size ? ((double)((long long)new_size - (long long)prev_size) / prev_size) * 100.0 : 0.0;
-    
+
     fprintf(stderr, "Total Compressed Size: %zu bytes\n", new_size);
     fprintf(stderr, "Reduction vs Identity Mapping : %+10.3f%%\n", pct_id);
     fprintf(stderr, "Reduction vs Initial State    : %+10.3f%%\n", pct_init);
@@ -197,16 +194,16 @@ void report_improvement(const RemapTable& remap, unsigned long long iter, double
     fprintf(stderr, "Temperature: %.4f\n", T);
     fprintf(stderr, "P(Accept) for Regressions     : +0.01%%: %.8f | +0.1%%: %.8f | +1%%: %.8f\n", 
             prob_0_01, prob_0_10, prob_1_00);
-            
+
     fprintf(stderr, "\nCurrent Remap Table Dump:\n");
     print_remap_table_as_source("current_remap", remap);
     fprintf(stderr, "========================================================================\n\n");
 }
 
 /**
- * Algorithm: Asynchronous Greedy Worker Thread (Unbounded BFS)
- * Manages concurrent local greedy exploration. Runs Breadth-First Search without 
- * depth limits. Evaluates all victim-index swaps, queuing states that maintain 
+ * Algorithm: Asynchronous Greedy Worker Thread (BFS)
+ * Manages concurrent local greedy exploration. Runs Breadth-First Search. 
+ * Evaluates all victim-index swaps, queuing states that maintain 
  * or decrease total size. Instantly aborts and resets state when a new Annealing
  * best is found.
  */
@@ -218,15 +215,15 @@ public:
     };
 
     struct BFSNode {
-        RemapTable remap;
+        uint64_t state;
         size_t size;
         int depth;
     };
 
     GreedyWorker(const std::vector<FileData>& files, size_t max_file_size, int victim_idx,
-                 int dict, int lc, int lp, int pb)
+                 int dict, int lc, int lp, int pb, int start_bfs_depth)
         : files_(files), max_file_size_(max_file_size), victim_index_(victim_idx),
-          dict_(dict), lc_(lc), lp_(lp), pb_(pb),
+          dict_(dict), lc_(lc), lp_(lp), pb_(pb), start_bfs_depth_(start_bfs_depth),
           stop_flag_(false), new_task_flag_(false), has_best_(false),
           best_size_(std::numeric_limits<size_t>::max()) 
     {
@@ -277,6 +274,17 @@ public:
     }
 
 private:
+    static RemapTable reconstruct_remap(uint64_t state, const RemapTable& root_remap, int victim_index) {
+        RemapTable remap = root_remap;
+        while (true) {
+            uint8_t idx = static_cast<uint8_t>(state & 0xFF);
+            if (idx == victim_index) break;
+            std::swap(remap[victim_index], remap[idx]);
+            state >>= 8;
+        }
+        return remap;
+    }
+
     void run() {
         LZMAWorkspace ws(max_file_size_);
 
@@ -302,61 +310,134 @@ private:
     }
 
     void run_bfs(const Task& start_task, LZMAWorkspace& ws) {
-        std::queue<BFSNode> q;
-        std::unordered_set<RemapTable, RemapTableHash> visited;
+        int cumulative_depth = 0;
+        int current_max_depth = start_bfs_depth_;
+        Task current_root_task = start_task;
+        std::vector<uint64_t> visited_bits((1ULL << 24) / 64, 0);
 
-        q.push({start_task.remap, start_task.size, 0});
-        visited.insert(start_task.remap);
+        while (true) {
+again:;
+            uint64_t root_state = victim_index_;
 
-        while (!q.empty()) {
-            // Cancel immediately if Annealing thread posted a superior candidate
-            if (new_task_flag_ || stop_flag_) return;
+            std::queue<BFSNode> q;
+            std::unordered_set<uint64_t> visited_hash;
+            std::fill(visited_bits.begin(), visited_bits.end(), 0);
 
-            BFSNode curr = q.front();
-            q.pop();
+            q.push({root_state, current_root_task.size, 0});
+            uint32_t root_idx = root_state & 0xFFFFFF;
+            visited_bits[root_idx >> 6] |= (1ULL << (root_idx & 63));
 
-            for (int i = 0; i < 256; i++) {
-                if (i == victim_index_) continue;
+            uint64_t best_found_state = root_state;
+            int best_found_depth = 0;
+            size_t best_found_size = current_root_task.size;
+
+            RemapTable base_remap = current_root_task.remap;
+
+            while (!q.empty()) {
                 if (new_task_flag_ || stop_flag_) return;
 
-                RemapTable next_remap = curr.remap;
-                std::swap(next_remap[victim_index_], next_remap[i]);
-
-                size_t next_size = evaluate_remap(next_remap, files_, ws, 0, dict_, lc_, lp_, pb_);
-
-                // Strictly allow steps that improve compressed size or don't change it (<=)
-                if (next_size <= curr.size) {
-                    bool is_new_best = false;
-                    {
-                        std::lock_guard<std::mutex> lock(best_mtx_);
-                        if (next_size < best_size_) {
-                            best_size_ = next_size;
-                            best_remap_ = next_remap;
-                            has_best_ = true;
-                            is_new_best = true;
-                        }
-                    }
-
-                    if (is_new_best) {
+                BFSNode curr = q.front();
+                if (curr.depth >= current_max_depth) {
+                    // Consider restarting the search with a new root node
+                    if (best_found_size < current_root_task.size) {
                         std::lock_guard<std::recursive_mutex> s_lock(stderr_mtx);
                         fprintf(stderr, "========================================================================\n");
-                        fprintf(stderr, "/* [Greedy Worker] NEW GREEDY BEST FOUND AT BFS DEPTH %d */\n", curr.depth + 1);
-                        fprintf(stderr, "Started Refinement From Baseline Size : %zu bytes\n", start_task.size);
-                        fprintf(stderr, "New Greedy Best Size                  : %zu bytes\n", next_size);
-                        fprintf(stderr, "Absolute Byte Saved vs Start Baseline : %lld bytes\n", (long long)start_task.size - (long long)next_size);
-                        
-                        fprintf(stderr, "\nInitial State Worker Started From:\n");
-                        print_remap_table_as_source("initial_state_remap", start_task.remap);
-                        fprintf(stderr, "\nNew Greedy Best Remap Table Dump:\n");
-                        print_remap_table_as_source("greedy_best_remap", next_remap);
-                        fprintf(stderr, "========================================================================\n\n");
+                        fprintf(stderr, "/* [Greedy Worker] RESTARTING BFS SEARCH WITH A BETTER ROOT NODE */\n");
+                        current_root_task.remap = reconstruct_remap(best_found_state, base_remap, victim_index_);
+                        current_root_task.size = best_found_size;
+                        current_max_depth = start_bfs_depth_;
+                        cumulative_depth += best_found_depth;
+                        goto again;
+                    } else {
+                        std::lock_guard<std::recursive_mutex> s_lock(stderr_mtx);
+                        fprintf(stderr, "========================================================================\n");
+                        current_max_depth++;
+                        if (current_max_depth > 7) {
+                            fprintf(stderr, "/* [Greedy Worker] CAN'T INCREASE MAX BFS DEPTH TO %d */\n", current_max_depth);
+                            return;
+                        } else {
+                            fprintf(stderr, "/* [Greedy Worker] INCREASING BFS MAX DEPTH TO %d AND RESUMING */\n", current_max_depth);
+                            continue;
+                        }
+                    }
+                }
+                q.pop();
+                RemapTable curr_remap = reconstruct_remap(curr.state, base_remap, victim_index_);
+
+                for (int i = 0; i < 256; i++) {
+                    if (i == victim_index_) continue;
+                    if (new_task_flag_ || stop_flag_) return;
+
+                    uint64_t mask = (curr.depth == 0) ? 0 : ((1ULL << (curr.depth * 8)) - 1);
+                    uint64_t next_state = (curr.state & mask) 
+                                        | ((uint64_t)i << (curr.depth * 8)) 
+                                        | ((uint64_t)victim_index_ << ((curr.depth + 1) * 8));
+
+                    int next_depth = curr.depth + 1;
+                    bool is_visited = false;
+
+                    if (next_depth <= 3) {
+                        uint32_t idx = next_state & 0xFFFFFF;
+                        uint32_t word_idx = idx >> 6;
+                        uint32_t bit_idx = idx & 63;
+                        is_visited = (visited_bits[word_idx] & (1ULL << bit_idx)) != 0;
+                        if (!is_visited) visited_bits[word_idx] |= (1ULL << bit_idx);
+                    } else if (next_depth <= 7) {
+                        is_visited = !visited_hash.insert(next_state).second;
+                    } else {
+                        continue;
                     }
 
-                    if (visited.insert(next_remap).second) {
-                        q.push({next_remap, next_size, curr.depth + 1});
+                    if (is_visited) continue;
+
+                    RemapTable next_remap = curr_remap;
+                    std::swap(next_remap[victim_index_], next_remap[i]);
+
+                    size_t next_size = evaluate_remap(next_remap, files_, ws, 0, dict_, lc_, lp_, pb_);
+
+                    if (next_size <= curr.size) {
+                        bool is_new_best = false;
+                        {
+                            std::lock_guard<std::mutex> lock(best_mtx_);
+                            if (next_size < best_size_) {
+                                best_size_ = next_size;
+                                best_remap_ = next_remap;
+                                has_best_ = true;
+                                is_new_best = true;
+                            }
+                        }
+
+                        if (is_new_best) {
+                            std::lock_guard<std::recursive_mutex> s_lock(stderr_mtx);
+                            fprintf(stderr, "========================================================================\n");
+                            fprintf(stderr, "/* [Greedy Worker] NEW GREEDY BEST FOUND AT BFS DEPTH %d */\n", next_depth);
+                            fprintf(stderr, "Started Refinement From Baseline Size : %zu bytes\n", start_task.size);
+                            fprintf(stderr, "New Greedy Best Size                  : %zu bytes\n", next_size);
+                            fprintf(stderr, "Absolute Byte Saved vs Start Baseline : %lld bytes\n", (long long)start_task.size - (long long)next_size);
+
+                            fprintf(stderr, "\nInitial State Worker Started From:\n");
+                            print_remap_table_as_source("initial_state_remap", start_task.remap);
+                            if (start_task.remap != current_root_task.remap) {
+                                fprintf(stderr, "\nCurrent BFS Checkpoint:\n");
+                                print_remap_table_as_source("bfs_checkpoint_remap", current_root_task.remap);
+                            }
+                            fprintf(stderr, "\nCurrent Greedy Best Remap Table Dump (%d steps from start):\n", cumulative_depth + next_depth);
+                            print_remap_table_as_source("greedy_best_remap", next_remap);
+                            fprintf(stderr, "========================================================================\n\n");
+                        }
+
+                        if (next_size < best_found_size) {
+                            best_found_size = next_size;
+                            best_found_state = next_state;
+                            best_found_depth = next_depth;
+                        }
+
+                        q.push({next_state, next_size, next_depth});
                     }
                 }
             }
+
+            if (new_task_flag_ || stop_flag_) return;
         }
     }
 
@@ -364,6 +445,7 @@ private:
     size_t max_file_size_;
     int victim_index_;
     int dict_, lc_, lp_, pb_;
+    int start_bfs_depth_;
 
     std::thread worker_thread_;
     std::mutex mtx_;
@@ -379,21 +461,18 @@ private:
 };
 
 int main(int argc, char** argv) {
-    int timeout = 60;
-    double T_start = 30.0; // Default initial temperature
+    int timeout = 600;
+    double T_start = 50.0;
+    int bfs_depth = 1;
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
     std::vector<std::string> filenames;
 
-    /**
-     * Algorithm: Command Line Parsing
-     * Extracts runtime configuration including the --temperature flag,
-     * which dictates the initial entropy/chaos of the annealing process.
-     */
     for (int i = 1; i < argc; i++) {
         std::string_view arg(argv[i]);
         if (arg == "--help" || arg == "-h") { print_help(argv[0]); return EXIT_SUCCESS; }
         else if (arg.starts_with("--timeout=")) timeout = std::stoi(argv[i] + 10);
         else if (arg.starts_with("--temperature=")) T_start = std::stod(argv[i] + 14);
+        else if (arg.starts_with("--bfs-depth=")) bfs_depth = std::stoi(argv[i] + 12);
         else if (arg.starts_with("--dict=")) dict_param_kb = std::stoi(argv[i] + 7);
         else if (arg.starts_with("--lc=")) lc_param = std::stoi(argv[i] + 5);
         else if (arg.starts_with("--lp=")) lp_param = std::stoi(argv[i] + 5);
@@ -480,7 +559,7 @@ int main(int argc, char** argv) {
     }
 
     // Instantiate and launch asynchronous Greedy Refinement Worker Thread
-    GreedyWorker greedy_worker(files, max_file_size, victim_index, dict_param_kb, lc_param, lp_param, pb_param);
+    GreedyWorker greedy_worker(files, max_file_size, victim_index, dict_param_kb, lc_param, lp_param, pb_param, bfs_depth);
     greedy_worker.notify_new_annealing_best(sa_best_remap, sa_best_sum);
 
     auto start_time = std::chrono::steady_clock::now();
@@ -670,8 +749,13 @@ int main(int argc, char** argv) {
         
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "Last Greedy Best Size       : %zu bytes (%+10.3f%% vs Identity)\n\n", final_greedy_best, greedy_pct);
-        fprintf(stderr, "Final Optimal Remap Table (Greedy Worker Best):\n");
-        print_remap_table_as_source("optimal_remap", greedy_best_remap);
+        if (final_sa_best < final_greedy_best) {
+            fprintf(stderr, "\nFinal Optimal Remap Table (Annealing Best):\n");
+            print_remap_table_as_source("optimal_remap", sa_best_remap);
+        } else {
+            fprintf(stderr, "Final Optimal Remap Table (Greedy Worker Best):\n");
+            print_remap_table_as_source("optimal_remap", greedy_best_remap);
+        }
     } else {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "\nFinal Optimal Remap Table (Annealing Best):\n");
