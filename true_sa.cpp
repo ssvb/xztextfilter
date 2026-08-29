@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <lzma.h>
 
 /**
@@ -30,10 +31,11 @@
  *    - Identifies the "Victim Index" (lowest frequency byte), making it the 
  *      focal point for continuous remapping swaps.
  * 
- * 2. State Initialization
+ * 2. State Initialization & Persistent Seeding
  *    - Establishes a true Baseline using the Identity Mapping.
+ *    - Attempts to load a persistent seed matching the LZMA context parameters.
  *    - Randomly reshuffles the identity mapping (Fisher-Yates / std::shuffle) 
- *      for the Initial State.
+ *      for the Initial State if no seed is available.
  * 
  * 3. Simulated Annealing Phase (Main Thread)
  *    - Exponential Cooling Schedule lowers Temperature (T) over the timeout.
@@ -58,10 +60,12 @@
  *    - Restarts the BFS search with a new better root node even before
  *      reaching depth 7 if an improvement is found within the greedy depth.
  * 
- * 6. Final Extreme Evaluation
+ * 6. Final Extreme Evaluation & Seed Retention
  *    - Benchmarks the final SA best state and final Greedy best state against 
  *      the identity mapping using the LZMA2 "6e" preset, an 8MB dictionary, 
  *      and context parameters (lc, lp, pb) for maximum compression.
+ *    - Commits the globally optimal mapping back to the persistent seed file
+ *      if it improves upon the initial loaded state.
  * ==============================================================================
  */
 
@@ -87,6 +91,193 @@ struct LZMAWorkspace {
 
 using RemapTable = std::array<uint8_t, 256>;
 
+// ------------------------------------------------------------------------------------------
+// Rigid Seed File Parser & Permutation Validator
+// ------------------------------------------------------------------------------------------
+int load_seed_from_file(const char *filename, int lc, int lp, int pb, unsigned char *out_remap) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        return 0; // Fail silently, allows natural fallback to random shuffle
+    }
+
+    char target_decl[64];
+    snprintf(target_decl, sizeof(target_decl), "remap_seed_%d%d%d", lc, lp, pb);
+
+    char line[512];
+    int found_decl = 0;
+
+    // Scan for dynamic target array declaration
+    while (fgets(line, sizeof(line), file)) {
+        if (strstr(line, target_decl) != NULL) {
+            found_decl = 1;
+            break;
+        }
+    }
+
+    if (!found_decl) {
+        fclose(file);
+        return 0; 
+    }
+
+    int in_array = 0;
+    if (strchr(line, '{')) in_array = 1;
+    else {
+        while (fgets(line, sizeof(line), file)) {
+            if (strchr(line, '{')) {
+                in_array = 1;
+                break;
+            }
+        }
+    }
+
+    if (!in_array) {
+        fclose(file);
+        return 0; 
+    }
+
+    // Extract exact byte values
+    int count = 0, c;
+    while (count < 256 && (c = fgetc(file)) != EOF) {
+        if (c == '0') {
+            int next = fgetc(file);
+            if (next == 'x' || next == 'X') {
+                unsigned int val;
+                if (fscanf(file, "%2x", &val) == 1) out_remap[count++] = (unsigned char)val;
+            } else ungetc(next, file); 
+        } else if (c == '\'') {
+            int char_val = fgetc(file);
+            if (char_val == '\\') { 
+                int escaped = fgetc(file);
+                if (escaped == '\'') char_val = '\'';
+                else if (escaped == '\\') char_val = '\\';
+            }
+            out_remap[count++] = (unsigned char)char_val;
+            while ((c = fgetc(file)) != EOF && c != '\'') { }
+        } else if (c == '}') break; 
+    }
+    fclose(file);
+
+    if (count != 256) {
+        fprintf(stderr, "Error: Parsed %d bytes, expected 256.\n", count);
+        return 0;
+    }
+
+    /**
+     * Algorithm: Validating Permutation
+     * We iterate through the parsed 256-byte array and use a frequency map (boolean array)
+     * to guarantee no duplicates exist. Since the input array size is constrained to 256 
+     * and bounds are enforced by the uint8_t types, checking for uniqueness mathematically 
+     * proves it is a valid 0-255 mapping.
+     */
+    int seen[256] = {0};
+    for (int i = 0; i < 256; i++) {
+        if (seen[out_remap[i]]) {
+            fprintf(stderr, "Error: Seed file array contains duplicate value 0x%02X.\n", out_remap[i]);
+            return 0; 
+        }
+        seen[out_remap[i]] = 1;
+    }
+
+    return 1;
+}
+
+/**
+ * ==============================================================================
+ * Algorithm: Safe File Stream Patching (Seed Upgrade)
+ * ==============================================================================
+ * Streams the original file to a temporary .new file character by character. 
+ * When the target declaration signature is matched, it safely skips the old 
+ * array initialization payload and injects the new optimized permutation, 
+ * preserving all surrounding code, comments, and file structure. Atomically
+ * overwrites the target file upon completion. Handles file creation if missing.
+ */
+void save_seed_to_file(const char *filepath, int lc, int lp, int pb, const uint8_t *best_remap) {
+    char new_path[1024];
+    snprintf(new_path, sizeof(new_path), "%s.new", filepath);
+    
+    FILE *in = fopen(filepath, "r");
+    FILE *out = fopen(new_path, "w");
+    
+    if (!out) {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "/* Error: Could not open temp file '%s' for writing. */\n", new_path);
+        if (in) fclose(in);
+        return;
+    }
+
+    char target_decl[64];
+    snprintf(target_decl, sizeof(target_decl), "remap_seed_%d%d%d", lc, lp, pb);
+    
+    if (!in) {
+        // File does not exist, initialize a new file format
+        fprintf(out, "unsigned char %s[256] = {\n    ", target_decl);
+        for (int i = 0; i < 256; i++) {
+            fprintf(out, "0x%02x%s", best_remap[i], (i == 255) ? "" : ((i + 1) % 16 == 0 ? ",\n    " : ", "));
+        }
+        fprintf(out, "\n};\n");
+    } else {
+        int target_len = strlen(target_decl);
+        int match_idx = 0;
+        int in_target = 0;
+        int c;
+        int found_existing = 0;
+
+        while ((c = fgetc(in)) != EOF) {
+            if (!in_target) {
+                fputc(c, out);
+                if (c == target_decl[match_idx]) {
+                    match_idx++;
+                    if (match_idx == target_len) {
+                        in_target = 1; // Discovered the specific C array declaration block!
+                        found_existing = 1;
+                    }
+                } else {
+                    match_idx = (c == target_decl[0]) ? 1 : 0;
+                }
+            } else {
+                fputc(c, out);
+                // Search dynamically for the opening block '{' regardless of newlines/whitespace
+                if (c == '{') {
+                    fprintf(out, "\n    ");
+                    for (int i = 0; i < 256; i++) {
+                        fprintf(out, "0x%02x%s", best_remap[i], (i == 255) ? "" : ((i + 1) % 16 == 0 ? ",\n    " : ", "));
+                    }
+                    fprintf(out, "\n}");
+                    
+                    // Fast-forward input reader past the obsolete payload until the matching '}'
+                    int skip_c;
+                    while ((skip_c = fgetc(in)) != EOF) {
+                        if (skip_c == '}') break; 
+                    }
+                    in_target = 0;
+                    match_idx = 0;
+                }
+            }
+        }
+        
+        if (!found_existing) {
+            // Append securely to the end if the file existed but didn't have this target
+            fprintf(out, "\nunsigned char %s[256] = {\n    ", target_decl);
+            for (int i = 0; i < 256; i++) {
+                fprintf(out, "0x%02x%s", best_remap[i], (i == 255) ? "" : ((i + 1) % 16 == 0 ? ",\n    " : ", "));
+            }
+            fprintf(out, "\n};\n");
+        }
+        fclose(in);
+    }
+    
+    fclose(out);
+    
+    if (rename(new_path, filepath) != 0) {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "\n/* Error: Failed to atomicly rename '%s' to '%s'. */\n\n", new_path, filepath);
+    } else {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "\n/* Successfully saved optimized seed configuration to: %s */\n\n", filepath);
+    }
+}
+
+
 void print_help(const char* prog_name) {
     std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
     std::cout << "Usage: " << prog_name << " [OPTIONS] <input_file_1> [input_file_2 ...]\n\n"
@@ -98,7 +289,8 @@ void print_help(const char* prog_name) {
               << "  --dict=KB            Set LZMA dictionary size in kilobytes (default: 4).\n"
               << "  --lc=BITS            Set LZMA literal context bits (1-4, default: 3).\n"
               << "  --lp=BITS            Set LZMA literal position bits (0-4, default: 0).\n"
-              << "  --pb=BITS            Set LZMA position bits (0-4, default: 2).\n\n";
+              << "  --pb=BITS            Set LZMA position bits (0-4, default: 2).\n"
+              << "  --seedfile=FILE      Set persistent file to load/save remap seed configuration.\n\n";
 }
 
 /**
@@ -465,6 +657,7 @@ int main(int argc, char** argv) {
     double T_start = 50.0;
     int bfs_depth = 1;
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
+    std::string seedfile = "";
     std::vector<std::string> filenames;
 
     for (int i = 1; i < argc; i++) {
@@ -477,6 +670,7 @@ int main(int argc, char** argv) {
         else if (arg.starts_with("--lc=")) lc_param = std::stoi(argv[i] + 5);
         else if (arg.starts_with("--lp=")) lp_param = std::stoi(argv[i] + 5);
         else if (arg.starts_with("--pb=")) pb_param = std::stoi(argv[i] + 5);
+        else if (arg.starts_with("--seedfile=")) seedfile = arg.substr(11);
         else filenames.emplace_back(argv[i]);
     }
 
@@ -536,13 +730,27 @@ int main(int argc, char** argv) {
     size_t baseline_sum = evaluate_remap(identity_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param);
     double safe_baseline = baseline_sum > 0 ? static_cast<double>(baseline_sum) : 1.0;
 
-    /**
-     * Algorithm: Fisher-Yates Randomization (std::shuffle)
-     * Generates an unbiased, uniformly random permutation of the identity mapping 
-     * to serve as the initial chaotic state for the simulated annealing landscape.
-     */
-    RemapTable current_remap = identity_remap;
-    std::shuffle(current_remap.begin(), current_remap.end(), rng);
+    RemapTable current_remap;
+    bool seed_loaded = false;
+
+    if (!seedfile.empty()) {
+        if (load_seed_from_file(seedfile.c_str(), lc_param, lp_param, pb_param, current_remap.data())) {
+            seed_loaded = true;
+            std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+            fprintf(stderr, "/* Seed configuration loaded successfully from %s for %d%d%d */\n", seedfile.c_str(), lc_param, lp_param, pb_param);
+        }
+    }
+
+    if (!seed_loaded) {
+        /**
+         * Algorithm: Fisher-Yates Randomization (std::shuffle)
+         * Generates an unbiased, uniformly random permutation of the identity mapping 
+         * to serve as the initial chaotic state for the simulated annealing landscape.
+         * Used whenever a seed cannot be resolved.
+         */
+        current_remap = identity_remap;
+        std::shuffle(current_remap.begin(), current_remap.end(), rng);
+    }
 
     size_t initial_sum = evaluate_remap(current_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param);
     size_t current_sum = initial_sum;
@@ -555,7 +763,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Victim Index   : 0x%02X (Frequency: %llu bytes)\n", victim_index, byte_freq[victim_index]);
         fprintf(stderr, "Initial Temp   : %.2f\n", T_start);
         fprintf(stderr, "Baseline Size  : %zu bytes (Identity)\n", baseline_sum);
-        fprintf(stderr, "Initial Size   : %zu bytes (Shuffled)\n\n", initial_sum);
+        fprintf(stderr, "Initial Size   : %zu bytes (%s)\n\n", initial_sum, seed_loaded ? "Seed Loaded" : "Shuffled");
     }
 
     // Instantiate and launch asynchronous Greedy Refinement Worker Thread
@@ -577,7 +785,7 @@ int main(int argc, char** argv) {
     unsigned long long pending_iter = 0;
     double pending_elapsed = 0.0;
     size_t pending_new_size = 0, pending_prev_size = 0;
-    double pending_T = 0.0; // Captures exact Temperature at time of improvement
+    double pending_T = 0.0; 
 
     // SA Parameters
     double T_end = 0.1;
@@ -646,7 +854,7 @@ int main(int argc, char** argv) {
          */
         if (delta <= 0.0) {
             // ACCEPT: Decrease (or no change) in energy
-            if (delta < 0.0) { // Strictly smaller means an improvement worth reporting
+            if (delta < 0.0) { 
                 bool is_global_best = (test_sum < sa_best_sum);
                 
                 /**
@@ -713,7 +921,7 @@ int main(int argc, char** argv) {
     greedy_worker.stop();
 
     // =========================================================
-    // FINAL EVALUATION (Extreme Settings)
+    // FINAL EVALUATION (Extreme Settings) & PERSISTENT SAVE
     // =========================================================
     /**
      * Algorithm: Absolute Performance Benchmarking
@@ -743,16 +951,22 @@ int main(int argc, char** argv) {
 
     RemapTable greedy_best_remap;
     size_t greedy_fast_best = 0;
-    if (greedy_worker.get_best(greedy_best_remap, greedy_fast_best)) {
+    bool has_greedy_best = greedy_worker.get_best(greedy_best_remap, greedy_fast_best);
+    
+    RemapTable final_optimal_remap = sa_best_remap;
+    
+    if (has_greedy_best) {
         size_t final_greedy_best = evaluate_remap(greedy_best_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param);
         double greedy_pct = final_baseline ? ((double)((long long)final_greedy_best - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
         
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "Last Greedy Best Size       : %zu bytes (%+10.3f%% vs Identity)\n\n", final_greedy_best, greedy_pct);
+        
         if (final_sa_best < final_greedy_best) {
             fprintf(stderr, "\nFinal Optimal Remap Table (Annealing Best):\n");
             print_remap_table_as_source("optimal_remap", sa_best_remap);
         } else {
+            final_optimal_remap = greedy_best_remap;
             fprintf(stderr, "Final Optimal Remap Table (Greedy Worker Best):\n");
             print_remap_table_as_source("optimal_remap", greedy_best_remap);
         }
@@ -765,6 +979,20 @@ int main(int argc, char** argv) {
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "========================================================================\n");
+    }
+
+    // Determine if the best run yielded an improvement against the initial starting configuration
+    bool improvement_found = (sa_best_sum < initial_sum);
+    if (has_greedy_best && greedy_fast_best < initial_sum) {
+        improvement_found = true;
+    }
+
+    // Persist the seed if an improvement was found over the loaded state
+    if (!seedfile.empty() && improvement_found) {
+        save_seed_to_file(seedfile.c_str(), lc_param, lp_param, pb_param, final_optimal_remap.data());
+    } else if (!seedfile.empty() && !improvement_found) {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "\n/* Optimization concluded without improving upon the loaded seed. No file update executed. */\n");
     }
 
     return EXIT_SUCCESS;
