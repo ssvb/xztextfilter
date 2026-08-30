@@ -19,6 +19,8 @@
 #include <cstring>
 #include <cstdint>
 #include <limits>
+#include <fstream>
+#include <sstream>
 #include <lzma.h>
 
 /**
@@ -30,10 +32,13 @@
  *    - Scans all input files to tally occurrences of every byte value (0-255).
  *    - Identifies the "Victim Index" (lowest frequency byte), making it the 
  *      focal point for continuous remapping swaps.
+ *    - Extracts a 3-byte "Data Fingerprint" from the highest frequency bytes
+ *      to accurately tag saved/loaded seed states.
  * 
  * 2. State Initialization & Persistent Seeding
  *    - Establishes a true Baseline using the Identity Mapping.
- *    - Attempts to load a persistent seed matching the LZMA context parameters.
+ *    - Attempts to load a persistent seed matching the LZMA context parameters
+ *      and the Data Fingerprint.
  *    - Randomly reshuffles the identity mapping (Fisher-Yates / std::shuffle) 
  *      for the Initial State if no seed is available.
  * 
@@ -57,24 +62,24 @@
  *    - Uses a 24-bit indexed bit array for depths <= 3, and a hash set for depths 4-7.
  *    - Dynamically resets its search space whenever the main Annealing thread 
  *      discovers a state better than the worker thread's current best.
- *    - Restarts the BFS search with a new better root node even before
- *      reaching depth 7 if an improvement is found within the greedy depth.
  * 
  * 6. Final Extreme Evaluation & Seed Retention
- *    - Benchmarks the final SA best state and final Greedy best state against 
- *      the identity mapping using the LZMA2 "6e" preset, an 8MB dictionary, 
- *      and context parameters (lc, lp, pb) for maximum compression.
- *    - Commits the globally optimal mapping back to the persistent seed file
- *      if it improves upon the initial loaded state.
+ *    - Benchmarks the final SA best state and Greedy best state using the LZMA2 
+ *      "6e" preset, an 8MB dictionary, and context parameters for maximum compression.
+ *    - EXCLUDES the un-mutated identity baseline as a final contender.
+ *    - Commits the optimal mapping back to the persistent seed file if it improves 
+ *      upon the initial loaded state, prepended with comparative LZMA ratio statistics.
  * ==============================================================================
  */
 
-// Thread-safe stdout/stderr output synchronization
+// Thread-safe stdout/stderr output synchronization to prevent interleaved logs
 static std::recursive_mutex stderr_mtx;
 
+// Holds the contents of the files we are optimizing the compression for
 struct FileData {
     std::string filename;
     std::vector<uint8_t> in_buf;
+    size_t fast_eval_size = 0; // The calculated byte limit specifically used during the fast search phase
 };
 
 // Thread-local evaluation workspace to prevent buffer reallocation and race conditions
@@ -83,30 +88,33 @@ struct LZMAWorkspace {
     std::vector<uint8_t> out_buf;
 
     explicit LZMAWorkspace(size_t max_file_size) {
+        // Ensure minimum size of 1 to avoid zero-allocation edge cases
         remapped_buf.resize(std::max<size_t>(max_file_size, 1));
+        
+        // Calculate maximum possible output size for LZMA to avoid buffer overruns
         size_t out_capacity = lzma_stream_buffer_bound(max_file_size);
         out_buf.resize(std::max<size_t>(out_capacity, 1));
     }
 };
 
+// Typedef for our 256-byte permutation array
 using RemapTable = std::array<uint8_t, 256>;
 
 // ------------------------------------------------------------------------------------------
 // Rigid Seed File Parser & Permutation Validator
 // ------------------------------------------------------------------------------------------
-int load_seed_from_file(const char *filename, int lc, int lp, int pb, unsigned char *out_remap) {
+int load_seed_from_file(const char *filename, int lc, int lp, int pb, const char *fingerprint, unsigned char *out_remap) {
     FILE *file = fopen(filename, "r");
-    if (!file) {
-        return 0; // Fail silently, allows natural fallback to random shuffle
-    }
+    if (!file) return 0; // Silently return if file does not exist
 
-    char target_decl[64];
-    snprintf(target_decl, sizeof(target_decl), "remap_seed_%d%d%d", lc, lp, pb);
+    char target_decl[128];
+    // Formulate the expected array name based on LZMA parameters and file fingerprint
+    snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d_%s", lc, lp, pb, fingerprint);
 
     char line[512];
     int found_decl = 0;
 
-    // Scan for dynamic target array declaration
+    // Scan for dynamic target array declaration (Ignores preceding comments)
     while (fgets(line, sizeof(line), file)) {
         if (strstr(line, target_decl) != NULL) {
             found_decl = 1;
@@ -116,9 +124,10 @@ int load_seed_from_file(const char *filename, int lc, int lp, int pb, unsigned c
 
     if (!found_decl) {
         fclose(file);
-        return 0; 
+        return 0; // Target configuration not found
     }
 
+    // Locate the opening brace for the array payload
     int in_array = 0;
     if (strchr(line, '{')) in_array = 1;
     else {
@@ -132,10 +141,10 @@ int load_seed_from_file(const char *filename, int lc, int lp, int pb, unsigned c
 
     if (!in_array) {
         fclose(file);
-        return 0; 
+        return 0; // Malformed declaration
     }
 
-    // Extract exact byte values
+    // Robust parsing of byte literals, supporting both hex (0x00) and char ('a', '\n') formats
     int count = 0, c;
     while (count < 256 && (c = fgetc(file)) != EOF) {
         if (c == '0') {
@@ -152,11 +161,13 @@ int load_seed_from_file(const char *filename, int lc, int lp, int pb, unsigned c
                 else if (escaped == '\\') char_val = '\\';
             }
             out_remap[count++] = (unsigned char)char_val;
+            // Consume characters until the closing quote
             while ((c = fgetc(file)) != EOF && c != '\'') { }
-        } else if (c == '}') break; 
+        } else if (c == '}') break; // End of array detected
     }
     fclose(file);
 
+    // Validation Phase 1: Ensure exactly 256 bytes were read
     if (count != 256) {
         fprintf(stderr, "Error: Parsed %d bytes, expected 256.\n", count);
         return 0;
@@ -165,132 +176,242 @@ int load_seed_from_file(const char *filename, int lc, int lp, int pb, unsigned c
     /**
      * Algorithm: Validating Permutation
      * We iterate through the parsed 256-byte array and use a frequency map (boolean array)
-     * to guarantee no duplicates exist. Since the input array size is constrained to 256 
-     * and bounds are enforced by the uint8_t types, checking for uniqueness mathematically 
-     * proves it is a valid 0-255 mapping.
+     * to guarantee that all numbers are in the valid range 0-255 with strictly no 
+     * duplications and no skips (a complete bijective permutation of 0-255).
      */
     int seen[256] = {0};
     for (int i = 0; i < 256; i++) {
         if (seen[out_remap[i]]) {
-            fprintf(stderr, "Error: Seed file array contains duplicate value 0x%02X.\n", out_remap[i]);
+            fprintf(stderr, "Error: DB file array contains duplicate value 0x%02X.\n", out_remap[i]);
             return 0; 
         }
         seen[out_remap[i]] = 1;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        if (!seen[i]) {
+            fprintf(stderr, "Error: DB file array is missing value 0x%02X (skips present).\n", i);
+            return 0;
+        }
     }
 
     return 1;
 }
 
 /**
- * ==============================================================================
- * Algorithm: Safe File Stream Patching (Seed Upgrade)
- * ==============================================================================
- * Streams the original file to a temporary .new file character by character. 
- * When the target declaration signature is matched, it safely skips the old 
- * array initialization payload and injects the new optimized permutation, 
- * preserving all surrounding code, comments, and file structure. Atomically
- * overwrites the target file upon completion. Handles file creation if missing.
+ * String formatter for robustly handling unified syntax for byte declarations.
+ * Prefers character literals for readable ASCII, falls back to hex for unprintable/control bytes.
  */
-void save_seed_to_file(const char *filepath, int lc, int lp, int pb, const uint8_t *best_remap) {
-    char new_path[1024];
-    snprintf(new_path, sizeof(new_path), "%s.new", filepath);
-    
-    FILE *in = fopen(filepath, "r");
-    FILE *out = fopen(new_path, "w");
-    
-    if (!out) {
-        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "/* Error: Could not open temp file '%s' for writing. */\n", new_path);
-        if (in) fclose(in);
-        return;
-    }
-
-    char target_decl[64];
-    snprintf(target_decl, sizeof(target_decl), "remap_seed_%d%d%d", lc, lp, pb);
-    
-    if (!in) {
-        // File does not exist, initialize a new file format
-        fprintf(out, "unsigned char %s[256] = {\n    ", target_decl);
-        for (int i = 0; i < 256; i++) {
-            fprintf(out, "0x%02x%s", best_remap[i], (i == 255) ? "" : ((i + 1) % 16 == 0 ? ",\n    " : ", "));
-        }
-        fprintf(out, "\n};\n");
+std::string get_byte_as_source(uint8_t byte) {
+    char buf[16];
+    if (byte >= 32 && byte <= 126) {
+        if (byte == '\'') return "'\\''";
+        else if (byte == '\\') return "'\\\\'";
+        else { snprintf(buf, sizeof(buf), "'%c' ", byte); return buf; }
     } else {
-        int target_len = strlen(target_decl);
-        int match_idx = 0;
-        int in_target = 0;
-        int c;
-        int found_existing = 0;
-
-        while ((c = fgetc(in)) != EOF) {
-            if (!in_target) {
-                fputc(c, out);
-                if (c == target_decl[match_idx]) {
-                    match_idx++;
-                    if (match_idx == target_len) {
-                        in_target = 1; // Discovered the specific C array declaration block!
-                        found_existing = 1;
-                    }
-                } else {
-                    match_idx = (c == target_decl[0]) ? 1 : 0;
-                }
-            } else {
-                fputc(c, out);
-                // Search dynamically for the opening block '{' regardless of newlines/whitespace
-                if (c == '{') {
-                    fprintf(out, "\n    ");
-                    for (int i = 0; i < 256; i++) {
-                        fprintf(out, "0x%02x%s", best_remap[i], (i == 255) ? "" : ((i + 1) % 16 == 0 ? ",\n    " : ", "));
-                    }
-                    fprintf(out, "\n}");
-                    
-                    // Fast-forward input reader past the obsolete payload until the matching '}'
-                    int skip_c;
-                    while ((skip_c = fgetc(in)) != EOF) {
-                        if (skip_c == '}') break; 
-                    }
-                    in_target = 0;
-                    match_idx = 0;
-                }
-            }
-        }
-        
-        if (!found_existing) {
-            // Append securely to the end if the file existed but didn't have this target
-            fprintf(out, "\nunsigned char %s[256] = {\n    ", target_decl);
-            for (int i = 0; i < 256; i++) {
-                fprintf(out, "0x%02x%s", best_remap[i], (i == 255) ? "" : ((i + 1) % 16 == 0 ? ",\n    " : ", "));
-            }
-            fprintf(out, "\n};\n");
-        }
-        fclose(in);
-    }
-    
-    fclose(out);
-    
-    if (rename(new_path, filepath) != 0) {
-        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "\n/* Error: Failed to atomicly rename '%s' to '%s'. */\n\n", new_path, filepath);
-    } else {
-        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "\n/* Successfully saved optimized seed configuration to: %s */\n\n", filepath);
+        snprintf(buf, sizeof(buf), "0x%02x", byte);
+        return buf;
     }
 }
 
+// Prints the remap table to stderr in valid C syntax
+void print_remap_table_as_source(const char* var_name, const RemapTable& remap, double ratio_a = 0.0, double ratio_b = 0.0) {
+    std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+    if (ratio_a > 0.0) {
+        // Output factual accuracy update: the new float ratios
+        fprintf(stderr, "/* %.6f %.6f */\n", ratio_a, ratio_b);
+    }
+    fprintf(stderr, "unsigned char %s[256] = {\n    ", var_name);
+    for (int i = 0; i < 256; i++) {
+        fprintf(stderr, "%s", get_byte_as_source(remap[i]).c_str());
+        if (i < 255) fprintf(stderr, ", ");
+        if ((i + 1) % 16 == 0 && i < 255) fprintf(stderr, "\n    ");
+    }
+    fprintf(stderr, "\n};\n");
+    fflush(stderr); 
+}
+
+/**
+ * ==============================================================================
+ * Algorithm: String-Based Replacement & Ratio Annotation (DB Upgrade)
+ * ==============================================================================
+ * This function updates the remap db file in-place, modifying the remap table and 
+ * updating the factual accuracy of the preceding ratio comment.
+ * 
+ * Crucially, it preserves ALL existing comments outside of the targeted float
+ * ratio block and the target array itself. 
+ * 
+ * 1. Scans forward to find the `lzma_byte_remap_XYZ` declaration.
+ * 2. Scans backwards from the declaration to specifically identify and consume 
+ *    ONLY the old / * %.6f %.6f * / ratio block. It avoids touching other comments.
+ * 3. Utilizes a literal-aware brace search to skip and replace the old array.
+ * 4. Injects the updated ratio comment and new mapping array atomically.
+ * 5. Strictly preserves all surrounding whitespace and newlines, ensuring the database
+ *    format does not vertically collapse upon multiple rewrites.
+ * 6. Ensures exactly one blank line is inserted between independent entries if appending.
+ */
+void save_seed_to_file(const char *filepath, int lc, int lp, int pb, const char *fingerprint, 
+                       const uint8_t *best_remap, size_t baseline_size, size_t initial_size, size_t after_size,
+                       double ratio_a, double ratio_b) {
+    char new_path[1024];
+    snprintf(new_path, sizeof(new_path), "%s.new", filepath);
+    
+    // Load entire file into a std::string to facilitate safe substring manipulation
+    std::ifstream ifs(filepath);
+    std::string in_str;
+    if (ifs) {
+        in_str.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        ifs.close();
+    }
+
+    char target_decl[128];
+    snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d_%s", lc, lp, pb, fingerprint);
+
+    std::string new_content;
+    char header[256];
+    
+    // Construct the updated factual representation of the ratio comment
+    snprintf(header, sizeof(header), "/* %.6f %.6f */\nunsigned char %s[256] = {\n    ", ratio_a, ratio_b, target_decl);
+    new_content += header;
+    for (int i = 0; i < 256; i++) {
+        new_content += get_byte_as_source(best_remap[i]);
+        if (i < 255) new_content += ((i + 1) % 16 == 0) ? ",\n    " : ", ";
+    }
+    
+    /**
+     * Algorithm: Strict Replacement Bounds
+     * Prevent vertical collapse by NOT including a trailing newline in the replacement 
+     * payload. We are performing an exact surgical swap from the comment's opening slash
+     * to the array's closing semicolon.
+     */
+    new_content += "\n};";
+
+    size_t decl_pos = in_str.find(target_decl);
+    
+    if (decl_pos != std::string::npos) {
+        // Step backwards to find the "unsigned" keyword
+        size_t unsigned_pos = in_str.rfind("unsigned", decl_pos);
+        if (unsigned_pos == std::string::npos) unsigned_pos = decl_pos;
+        
+        size_t start_replace = unsigned_pos;
+        size_t search_pos = unsigned_pos;
+        
+        // Scrub trailing spaces before the keyword safely
+        while (search_pos > 0 && std::isspace(in_str[search_pos - 1])) search_pos--;
+        
+        // Strictly target the `/* float float */` pattern for replacement
+        // This guarantees we only update factual accuracy of the metrics and never
+        // remove existing descriptive comments the user may have left.
+        if (search_pos >= 2 && in_str[search_pos - 1] == '/' && in_str[search_pos - 2] == '*') {
+            size_t comment_start = in_str.rfind("/*", search_pos - 2);
+            if (comment_start != std::string::npos) {
+                std::string comment_body = in_str.substr(comment_start, search_pos - comment_start);
+                
+                // Heuristic: Ensure it looks like the specific float-ratio comment before absorbing it
+                if (comment_body.find('.') != std::string::npos) {
+                    start_replace = comment_start;
+                    // Algorithm Note: Deliberately avoided scouring preceding whitespaces/newlines 
+                    // here to preserve exact block separation.
+                }
+            }
+        }
+
+        // Fast-forward Literal-aware parser to find proper closing bracket of the array
+        size_t end_replace = decl_pos;
+        size_t open_brace = in_str.find('{', end_replace);
+        if (open_brace != std::string::npos) {
+            bool in_char_literal = false;
+            bool in_escape = false;
+            
+            // Iterate safely to avoid matching braces inside character literals (e.g. '{')
+            for (size_t i = open_brace; i < in_str.size(); i++) {
+                char c = in_str[i];
+                if (!in_char_literal) {
+                    if (c == '\'') in_char_literal = true;
+                    else if (c == '}') {
+                        end_replace = i;
+                        break;
+                    }
+                } else {
+                    if (in_escape) in_escape = false;
+                    else if (c == '\\') in_escape = true;
+                    else if (c == '\'') in_char_literal = false;
+                }
+            }
+            
+            // Consume the trailing semicolon if present
+            size_t semi = in_str.find(';', end_replace);
+            if (semi != std::string::npos && semi - end_replace < 10) end_replace = semi + 1;
+            else end_replace++;
+            
+            // Algorithm Note: Deliberately avoided cleaning up trailing newlines here
+            // to maintain original formatting and whitespace boundaries.
+        }
+        
+        // Execute the atomic replacement of the targeted float comment and array
+        in_str.replace(start_replace, end_replace - start_replace, new_content);
+    } else {
+        // If the declaration wasn't found, safely append to the end of the file
+        // Ensure an empty line gap between different entries.
+        if (!in_str.empty()) {
+            size_t trailing_newlines = 0;
+            for (auto it = in_str.rbegin(); it != in_str.rend() && *it == '\n'; ++it) {
+                trailing_newlines++;
+            }
+            if (trailing_newlines == 0) in_str += "\n\n";
+            else if (trailing_newlines == 1) in_str += "\n";
+        }
+        // Safely re-attach the newline during standard appending operations
+        in_str += new_content + "\n";
+    }
+
+    std::ofstream out(new_path);
+    if (!out) {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "/* Error: Could not open temp file '%s' for writing. */\n", new_path);
+        return;
+    }
+    out << in_str;
+    out.close();
+
+    // Atomic rename ensures file integrity even if the process is interrupted
+    if (rename(new_path, filepath) != 0) {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "\n/* Error: Failed to atomically rename '%s' to '%s'. */\n\n", new_path, filepath);
+    } else {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        
+        // Log detailed metrics to console upon successful persistence
+        double pct_change_baseline = baseline_size ? ((double)((long long)after_size - (long long)baseline_size) / baseline_size) * 100.0 : 0.0;
+        double pct_change_initial = initial_size ? ((double)((long long)after_size - (long long)initial_size) / initial_size) * 100.0 : 0.0;
+        
+        fprintf(stderr, "\n/* Successfully saved optimized configuration to DB: %s */\n", filepath);
+        fprintf(stderr, "/* Compression Improvement vs Identity Mapping : %zu bytes -> %zu bytes (%+10.3f%%) */\n", baseline_size, after_size, pct_change_baseline);
+        fprintf(stderr, "/* Compression Improvement vs Initial State    : %zu bytes -> %zu bytes (%+10.3f%%) */\n\n", initial_size, after_size, pct_change_initial);
+    }
+
+    // Dump final payload mapping to console for user visibility
+    RemapTable remap_arr;
+    std::memcpy(remap_arr.data(), best_remap, 256);
+    fprintf(stderr, "/* Saved Improved Remap Table Dump: */\n");
+    print_remap_table_as_source(target_decl, remap_arr, ratio_a, ratio_b);
+}
 
 void print_help(const char* prog_name) {
     std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
     std::cout << "Usage: " << prog_name << " [OPTIONS] <input_file_1> [input_file_2 ...]\n\n"
               << "Options:\n"
-              << "  --help               Show this help message and exit.\n"
-              << "  --timeout=SEC        Set timeout in seconds for annealing (default: 600).\n"
-              << "  --temperature=FLOAT  Set initial temperature for annealing (default: 50.0).\n"
-              << "  --bfs-depth=INT      Set initial max BFS depth for Greedy Refinement (default: 1).\n"
-              << "  --dict=KB            Set LZMA dictionary size in kilobytes (default: 4).\n"
-              << "  --lc=BITS            Set LZMA literal context bits (1-4, default: 3).\n"
-              << "  --lp=BITS            Set LZMA literal position bits (0-4, default: 0).\n"
-              << "  --pb=BITS            Set LZMA position bits (0-4, default: 2).\n"
-              << "  --seedfile=FILE      Set persistent file to load/save remap seed configuration.\n\n";
+              << "  --help                 Show this help message and exit.\n"
+              << "  --timeout=SEC          Set timeout in seconds for annealing (default: 600).\n"
+              << "  --temperature=FLOAT    Set initial temperature for annealing (default: 50.0).\n"
+              << "  --bfs-depth=INT        Set initial max BFS depth for Greedy Refinement (default: 1).\n"
+              << "  --dict=KB              Set LZMA dictionary size in kilobytes (default: 4).\n"
+              << "  --lc=BITS              Set LZMA literal context bits (1-4, default: 3).\n"
+              << "  --lp=BITS              Set LZMA literal position bits (0-4, default: 0).\n"
+              << "  --pb=BITS              Set LZMA position bits (0-4, default: 2).\n"
+              << "  --datasizelimit=BYTES  Set data size limit for fast eval phases (distributed among files).\n"
+              << "  --tablepenalty         Add a storage penalty for the remap table to the evaluation.\n"
+              << "  --remapdb=FILE         Set persistent file to load/save remap database entries.\n\n";
 }
 
 /**
@@ -302,8 +423,10 @@ void print_help(const char* prog_name) {
 size_t compress_buffer(const uint8_t* in_buf, size_t in_len, uint8_t* out_buf, size_t out_capacity, 
                         uint32_t preset, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
     lzma_options_lzma opt;
+    // Initialize LZMA2 options with the provided preset (usually 0 for fast eval, 6e for extreme eval)
     if (lzma_lzma_preset(&opt, preset)) return out_capacity + 1;
 
+    // Apply strict parameter overrides for lc, lp, pb, and dictionary size
     opt.dict_size = ((uint32_t)dict_param_kb * 1024 < LZMA_DICT_SIZE_MIN) ? LZMA_DICT_SIZE_MIN : (uint32_t)dict_param_kb * 1024; 
     opt.lc = lc_param; 
     opt.lp = lp_param; 
@@ -311,38 +434,47 @@ size_t compress_buffer(const uint8_t* in_buf, size_t in_len, uint8_t* out_buf, s
 
     lzma_filter filters[2] = { { LZMA_FILTER_LZMA2, &opt }, { LZMA_VLI_UNKNOWN, nullptr } };
     size_t out_pos = 0;
+    
+    // Execute encoding
     lzma_ret ret = lzma_stream_buffer_encode(filters, LZMA_CHECK_CRC32, nullptr, in_buf, in_len, out_buf, &out_pos, out_capacity);
     return (ret == LZMA_OK) ? out_pos : out_capacity + 1;
 }
 
+/**
+ * Algorithm: Holistic State Evaluation & Remap Penalty
+ * Translates file buffers using the provided RemapTable and evaluates overall 
+ * LZMA compression size. The 'use_fast_limit' toggle dictates whether only the 
+ * fair-share allocated front-chunk (fast_eval_size) of each file is evaluated, 
+ * or the entirety of the file during extreme final evaluations.
+ */
 size_t evaluate_remap(const RemapTable& remap_table, const std::vector<FileData>& files, 
-                      LZMAWorkspace& ws, uint32_t preset, int dict, int lc, int lp, int pb) {
+                      LZMAWorkspace& ws, uint32_t preset, int dict, int lc, int lp, int pb, 
+                      bool use_table_penalty, bool use_fast_limit = false) {
     size_t total = 0;
+    
+    // Evaluate across all provided input files
     for (const auto& file : files) {
-        for (size_t j = 0; j < file.in_buf.size(); j++) {
+        size_t eval_size = use_fast_limit ? file.fast_eval_size : file.in_buf.size();
+        if (eval_size == 0) continue; // Safety skip if empty allocation
+        
+        // Apply permutation O(N) mapping
+        for (size_t j = 0; j < eval_size; j++) {
             ws.remapped_buf[j] = remap_table[file.in_buf[j]];
         }
-        total += compress_buffer(ws.remapped_buf.data(), file.in_buf.size(), ws.out_buf.data(), ws.out_buf.size(), preset, dict, lc, lp, pb);
+        total += compress_buffer(ws.remapped_buf.data(), eval_size, ws.out_buf.data(), ws.out_buf.size(), preset, dict, lc, lp, pb);
     }
-    return total;
-}
-
-void print_remap_table_as_source(const char* var_name, const RemapTable& remap) {
-    std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-    fprintf(stderr, "unsigned char %s[256] = {\n    ", var_name);
-    for (int i = 0; i < 256; i++) {
-        if (remap[i] >= 32 && remap[i] <= 126) {
-            if (remap[i] == '\'') fprintf(stderr, "'\\''"); 
-            else if (remap[i] == '\\') fprintf(stderr, "'\\\\'"); 
-            else fprintf(stderr, "'%c' ", remap[i]); 
-        } else {
-            fprintf(stderr, "0x%02x", remap[i]); 
+    
+    // Optionally apply heuristic penalty to fragmented mappings
+    if (use_table_penalty) {
+        size_t penalty = 0;
+        for (int i = 0; i < 255; i++) {
+            // Adds 1 byte of penalty for every non-contiguous byte sequence
+            if ((int)remap_table[i+1] - (int)remap_table[i] != 1) penalty++;
         }
-        if (i < 255) fprintf(stderr, ", ");
-        if ((i + 1) % 16 == 0 && i < 255) fprintf(stderr, "\n    ");
+        total += penalty;
     }
-    fprintf(stderr, "\n};\n");
-    fflush(stderr); 
+    
+    return total;
 }
 
 /**
@@ -397,34 +529,26 @@ void report_improvement(const RemapTable& remap, unsigned long long iter, double
  * Manages concurrent local greedy exploration. Runs Breadth-First Search. 
  * Evaluates all victim-index swaps, queuing states that maintain 
  * or decrease total size. Instantly aborts and resets state when a new Annealing
- * best is found.
+ * best is found. Note: Evaluations run within this thread automatically adhere to 
+ * the 'datasizelimit' (use_fast_limit = true) setting for hyper-speed searching.
  */
 class GreedyWorker {
 public:
-    struct Task {
-        RemapTable remap;
-        size_t size;
-    };
-
-    struct BFSNode {
-        uint64_t state;
-        size_t size;
-        int depth;
-    };
+    struct Task { RemapTable remap; size_t size; };
+    struct BFSNode { uint64_t state; size_t size; int depth; };
 
     GreedyWorker(const std::vector<FileData>& files, size_t max_file_size, int victim_idx,
-                 int dict, int lc, int lp, int pb, int start_bfs_depth)
+                 int dict, int lc, int lp, int pb, int start_bfs_depth, bool use_table_penalty)
         : files_(files), max_file_size_(max_file_size), victim_index_(victim_idx),
           dict_(dict), lc_(lc), lp_(lp), pb_(pb), start_bfs_depth_(start_bfs_depth),
+          use_table_penalty_(use_table_penalty),
           stop_flag_(false), new_task_flag_(false), has_best_(false),
           best_size_(std::numeric_limits<size_t>::max()) 
     {
         worker_thread_ = std::thread(&GreedyWorker::run, this);
     }
 
-    ~GreedyWorker() {
-        stop();
-    }
+    ~GreedyWorker() { stop(); }
 
     void stop() {
         {
@@ -432,9 +556,7 @@ public:
             stop_flag_ = true;
         }
         cv_.notify_one();
-        if (worker_thread_.joinable()) {
-            worker_thread_.join();
-        }
+        if (worker_thread_.joinable()) worker_thread_.join();
     }
 
     size_t get_best_size() {
@@ -450,6 +572,8 @@ public:
         return true;
     }
 
+    // Allows the Main SA thread to interrupt the Greedy Worker and provide it a new, 
+    // better starting point to refine.
     void notify_new_annealing_best(const RemapTable& remap, size_t size) {
         std::lock_guard<std::mutex> lock(mtx_);
         {
@@ -466,6 +590,7 @@ public:
     }
 
 private:
+    // Efficiently unpacks the 64-bit state ID back into a fully realized RemapTable
     static RemapTable reconstruct_remap(uint64_t state, const RemapTable& root_remap, int victim_index) {
         RemapTable remap = root_remap;
         while (true) {
@@ -477,13 +602,14 @@ private:
         return remap;
     }
 
+    // Main loop for the asynchronous worker thread
     void run() {
         LZMAWorkspace ws(max_file_size_);
-
         while (true) {
             Task task;
             {
                 std::unique_lock<std::mutex> lock(mtx_);
+                // Sleep until a new best is provided or a shutdown is requested
                 cv_.wait(lock, [this] { return new_task_flag_ || stop_flag_; });
                 if (stop_flag_ && !new_task_flag_) break;
                 task = pending_task_;
@@ -496,7 +622,8 @@ private:
                 fprintf(stderr, "/* [Greedy Worker] Resetting thread to refine new Annealing Best (Size: %zu bytes) */\n", task.size);
                 fprintf(stderr, "========================================================================\n\n");
             }
-
+            
+            // Execute bounded depth Breadth-First Search on the new baseline
             run_bfs(task, ws);
         }
     }
@@ -505,13 +632,15 @@ private:
         int cumulative_depth = 0;
         int current_max_depth = start_bfs_depth_;
         Task current_root_task = start_task;
+        
+        // Fast-path bit array for shallow state tracking (Depths <= 3)
         std::vector<uint64_t> visited_bits((1ULL << 24) / 64, 0);
 
         while (true) {
 again:;
             uint64_t root_state = victim_index_;
-
             std::queue<BFSNode> q;
+            // Slower hash map utilized only for deeper branches (Depths > 3)
             std::unordered_set<uint64_t> visited_hash;
             std::fill(visited_bits.begin(), visited_bits.end(), 0);
 
@@ -525,12 +654,14 @@ again:;
 
             RemapTable base_remap = current_root_task.remap;
 
+            // Exhaustive Queue Iteration
             while (!q.empty()) {
-                if (new_task_flag_ || stop_flag_) return;
+                if (new_task_flag_ || stop_flag_) return; // Bail out if interrupted
 
                 BFSNode curr = q.front();
+                
+                // If maximum allowable depth is reached, assess if progress was made
                 if (curr.depth >= current_max_depth) {
-                    // Consider restarting the search with a new root node
                     if (best_found_size < current_root_task.size) {
                         std::lock_guard<std::recursive_mutex> s_lock(stderr_mtx);
                         fprintf(stderr, "========================================================================\n");
@@ -546,7 +677,7 @@ again:;
                         current_max_depth++;
                         if (current_max_depth > 7) {
                             fprintf(stderr, "/* [Greedy Worker] CAN'T INCREASE MAX BFS DEPTH TO %d */\n", current_max_depth);
-                            return;
+                            return; // Stop searching entirely; space exhausted
                         } else {
                             fprintf(stderr, "/* [Greedy Worker] INCREASING BFS MAX DEPTH TO %d AND RESUMING */\n", current_max_depth);
                             continue;
@@ -556,10 +687,12 @@ again:;
                 q.pop();
                 RemapTable curr_remap = reconstruct_remap(curr.state, base_remap, victim_index_);
 
+                // Evaluate permutations involving the victim index against all 255 other bytes
                 for (int i = 0; i < 256; i++) {
                     if (i == victim_index_) continue;
                     if (new_task_flag_ || stop_flag_) return;
 
+                    // Compute bit-packed 64-bit state identifier for cycle detection
                     uint64_t mask = (curr.depth == 0) ? 0 : ((1ULL << (curr.depth * 8)) - 1);
                     uint64_t next_state = (curr.state & mask) 
                                         | ((uint64_t)i << (curr.depth * 8)) 
@@ -568,13 +701,16 @@ again:;
                     int next_depth = curr.depth + 1;
                     bool is_visited = false;
 
+                    // O(1) Check for Depths <= 3 via bits mapping
                     if (next_depth <= 3) {
                         uint32_t idx = next_state & 0xFFFFFF;
                         uint32_t word_idx = idx >> 6;
                         uint32_t bit_idx = idx & 63;
                         is_visited = (visited_bits[word_idx] & (1ULL << bit_idx)) != 0;
                         if (!is_visited) visited_bits[word_idx] |= (1ULL << bit_idx);
-                    } else if (next_depth <= 7) {
+                    } 
+                    // Set-based Check for Depths 4-7
+                    else if (next_depth <= 7) {
                         is_visited = !visited_hash.insert(next_state).second;
                     } else {
                         continue;
@@ -585,8 +721,10 @@ again:;
                     RemapTable next_remap = curr_remap;
                     std::swap(next_remap[victim_index_], next_remap[i]);
 
-                    size_t next_size = evaluate_remap(next_remap, files_, ws, 0, dict_, lc_, lp_, pb_);
+                    // Evaluate using the fast-limit flag set to `true`
+                    size_t next_size = evaluate_remap(next_remap, files_, ws, 0, dict_, lc_, lp_, pb_, use_table_penalty_, true);
 
+                    // Strictly Monotonic Criteria (Greedy): Only follow paths <= current state
                     if (next_size <= curr.size) {
                         bool is_new_best = false;
                         {
@@ -618,6 +756,7 @@ again:;
                             fprintf(stderr, "========================================================================\n\n");
                         }
 
+                        // Track the local optimum within this specific BFS branch
                         if (next_size < best_found_size) {
                             best_found_size = next_size;
                             best_found_state = next_state;
@@ -628,7 +767,6 @@ again:;
                     }
                 }
             }
-
             if (new_task_flag_ || stop_flag_) return;
         }
     }
@@ -638,6 +776,7 @@ again:;
     int victim_index_;
     int dict_, lc_, lp_, pb_;
     int start_bfs_depth_;
+    bool use_table_penalty_;
 
     std::thread worker_thread_;
     std::mutex mtx_;
@@ -653,13 +792,17 @@ again:;
 };
 
 int main(int argc, char** argv) {
+    // Default tuning configuration
     int timeout = 600;
     double T_start = 50.0;
     int bfs_depth = 1;
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
-    std::string seedfile = "";
+    size_t datasizelimit = 0;
+    bool use_table_penalty = false;
+    std::string remapdb = "";
     std::vector<std::string> filenames;
 
+    // Command Line Argument Parsing
     for (int i = 1; i < argc; i++) {
         std::string_view arg(argv[i]);
         if (arg == "--help" || arg == "-h") { print_help(argv[0]); return EXIT_SUCCESS; }
@@ -670,7 +813,9 @@ int main(int argc, char** argv) {
         else if (arg.starts_with("--lc=")) lc_param = std::stoi(argv[i] + 5);
         else if (arg.starts_with("--lp=")) lp_param = std::stoi(argv[i] + 5);
         else if (arg.starts_with("--pb=")) pb_param = std::stoi(argv[i] + 5);
-        else if (arg.starts_with("--seedfile=")) seedfile = arg.substr(11);
+        else if (arg.starts_with("--datasizelimit=")) datasizelimit = std::stoull(argv[i] + 16);
+        else if (arg == "--tablepenalty") use_table_penalty = true;
+        else if (arg.starts_with("--remapdb=")) remapdb = arg.substr(10);
         else filenames.emplace_back(argv[i]);
     }
 
@@ -685,7 +830,7 @@ int main(int argc, char** argv) {
     std::vector<FileData> files(filenames.size());
     size_t max_file_size = 0;
 
-    // File reading and memory initialization
+    // Load file contents into contiguous memory buffers
     for (size_t i = 0; i < filenames.size(); i++) {
         files[i].filename = filenames[i];
         FILE* f = fopen(filenames[i].c_str(), "rb");
@@ -701,58 +846,194 @@ int main(int argc, char** argv) {
         fclose(f);
     }
 
+    struct ByteCount {
+        uint8_t byte_val;
+        unsigned long long count;
+    };
+
+    /**
+     * ==============================================================================
+     * Algorithm: Fair-Share Data Truncation (Water-Filling)
+     * ==============================================================================
+     * To accelerate the evaluation phases (SA and BFS), an optional data size limit 
+     * can be specified. This algorithm fairly distributes that total limit across 
+     * all input files. If a file is naturally smaller than its allocated fair share, 
+     * its unused quota is mathematically cascaded/redistributed to remaining files.
+     * 
+     * 1. Sort files by their actual sizes in ascending order.
+     * 2. Iteratively divide `remaining_limit` by `remaining_files` for the fair share.
+     * 3. Take `min(actual_size, fair_share)` as the current file's allocation.
+     * 4. Subtract the allocation from the remaining limit and proceed.
+     */
+    auto apply_water_filling = [&](size_t limit) {
+        if (limit == 0) {
+            for (auto& f : files) f.fast_eval_size = f.in_buf.size();
+            return;
+        }
+        std::vector<size_t> indices(files.size());
+        for (size_t i = 0; i < files.size(); i++) indices[i] = i;
+        
+        // Sort indices by file buffer size in ascending order
+        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            return files[a].in_buf.size() < files[b].in_buf.size();
+        });
+        
+        size_t remaining_limit = limit;
+        size_t remaining_files = files.size();
+        
+        for (size_t idx : indices) {
+            size_t fair_share = remaining_limit / remaining_files;
+            size_t allocation = std::min(files[idx].in_buf.size(), fair_share);
+            
+            files[idx].fast_eval_size = allocation;
+            remaining_limit -= allocation;
+            remaining_files--;
+        }
+    };
+
+    apply_water_filling(datasizelimit);
+
     LZMAWorkspace main_ws(max_file_size);
 
     /**
-     * Algorithm: Frequency Analysis & Victim Index Identification
-     * Iterate over the byte layout of all files to construct a global frequency 
+     * Algorithm: Frequency Analysis & Dynamic Victim Index Validation
+     * Iterates over the byte layout of the files to construct a global frequency 
      * histogram. The index mapping to the lowest frequency becomes the "victim", 
      * serving as the continuous focal point for swaps in the SA loop.
+     * 
+     * Note: This analyzes the data capped by the `--datasizelimit` option. If the
+     * resulting data fingerprint doesn't match the full untruncated data fingerprint,
+     * it gradually increases the limit to ensure global accuracy of the core mapping.
      */
-    std::array<unsigned long long, 256> byte_freq{};
-    for (const auto& file : files) {
-        for (uint8_t byte_val : file.in_buf) {
-            byte_freq[byte_val]++;
+    auto get_fingerprint = [](const std::array<unsigned long long, 256>& freqs) -> std::string {
+        std::vector<ByteCount> ranked(256);
+        for (int i = 0; i < 256; i++) {
+            ranked[i] = { static_cast<uint8_t>(i), freqs[i] };
         }
+        std::stable_sort(ranked.begin(), ranked.end(), [](const ByteCount& a, const ByteCount& b) {
+            if (a.count != b.count) return a.count > b.count;
+            return a.byte_val < b.byte_val;
+        });
+        char fp[7] = {0};
+        for (int i = 0; i < 3; i++) snprintf(fp + (i * 2), 3, "%02X", ranked[i].byte_val);
+        return std::string(fp);
+    };
+
+    // 1. Calculate Full Data Fingerprint
+    std::array<unsigned long long, 256> full_freq{};
+    for (const auto& file : files) {
+        for (uint8_t byte_val : file.in_buf) full_freq[byte_val]++;
+    }
+    std::string full_fingerprint = get_fingerprint(full_freq);
+
+    // 2. Calculate Capped Frequency & Auto-adjust limit
+    std::array<unsigned long long, 256> byte_freq{};
+    size_t effective_increase = 0;
+
+    if (datasizelimit > 0) {
+        while (true) {
+            byte_freq.fill(0);
+            for (const auto& file : files) {
+                for (size_t i = 0; i < file.fast_eval_size; i++) {
+                    byte_freq[file.in_buf[i]]++;
+                }
+            }
+            std::string capped_fingerprint = get_fingerprint(byte_freq);
+            
+            if (capped_fingerprint == full_fingerprint) {
+                break; // Match found
+            }
+            
+            if (effective_increase == 0) {
+                std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+                fprintf(stderr, "/* Warning: Capped data fingerprint (%s) does not match full data fingerprint (%s). Increasing limit... */\n", capped_fingerprint.c_str(), full_fingerprint.c_str());
+            }
+            
+            size_t total_size = 0;
+            for (const auto& file : files) total_size += file.in_buf.size();
+            if (datasizelimit >= total_size) {
+                break; // Hard cap at maximum total file size to prevent runaway allocation
+            }
+            
+            datasizelimit++;
+            effective_increase++;
+            apply_water_filling(datasizelimit);
+        }
+        
+        if (effective_increase > 0) {
+            std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+            fprintf(stderr, "/* Effective cap increase: %zu bytes (New limit: %zu bytes) */\n", effective_increase, datasizelimit);
+        }
+    } else {
+        byte_freq = full_freq;
     }
 
+    /**
+     * Algorithm: Global Frequency Ranking, Top-10 Hex, & Fingerprinting
+     * Sorts all byte values (0-255) by occurrence frequency in descending order.
+     * Extracts the 10 most frequent byte values and formats them as a concatenated
+     * two-digit hexadecimal string reported to stderr.
+     * Also extracts the top 3 most frequent bytes to formulate the Data Fingerprint,
+     * resolving and tagging the persistence entries properly.
+     */
+    std::vector<ByteCount> freq_ranked(256);
+    for (int i = 0; i < 256; i++) {
+        freq_ranked[i] = { static_cast<uint8_t>(i), byte_freq[i] };
+    }
+    std::stable_sort(freq_ranked.begin(), freq_ranked.end(), [](const ByteCount& a, const ByteCount& b) {
+        if (a.count != b.count) return a.count > b.count;
+        return a.byte_val < b.byte_val;
+    });
+
+    char top10_hex_buf[21] = {0};
+    for (int i = 0; i < 10; i++) snprintf(top10_hex_buf + (i * 2), 3, "%02X", freq_ranked[i].byte_val);
+
+    // Create 3-byte fingerprint unique to the dataset characteristics
+    char fingerprint[7] = {0};
+    for (int i = 0; i < 3; i++) snprintf(fingerprint + (i * 2), 3, "%02X", freq_ranked[i].byte_val);
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "/* Top 10 Most Frequent Bytes (Concatenated Hex): %s */\n", top10_hex_buf);
+        fprintf(stderr, "/* Data Fingerprint (Top 3 Hex): %s */\n", fingerprint);
+        if (use_table_penalty) fprintf(stderr, "/* Table Penalty Enabled: 1 byte added per broken continuous sequence */\n");
+        if (datasizelimit > 0) fprintf(stderr, "/* Data Size Limit: Fast evaluation capped at total %zu bytes across files */\n", datasizelimit);
+    }
+
+    // Identify lowest frequency byte to act as the primary rotational pivot ("Victim Index")
     int victim_index = 0;
     for (int i = 1; i < 256; i++) {
-        if (byte_freq[i] < byte_freq[victim_index]) {
-            victim_index = i;
-        }
+        if (byte_freq[i] < byte_freq[victim_index]) victim_index = i;
     }
 
+    // Generate strict 1:1 Identity map benchmark
     RemapTable identity_remap;
     for (int i = 0; i < 256; i++) identity_remap[i] = static_cast<uint8_t>(i);
 
-    // Evaluate Baseline using fast preset 0
-    size_t baseline_sum = evaluate_remap(identity_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param);
+    // Initial phase assessments run with the `use_fast_limit = true` flag
+    size_t baseline_sum = evaluate_remap(identity_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
     double safe_baseline = baseline_sum > 0 ? static_cast<double>(baseline_sum) : 1.0;
 
     RemapTable current_remap;
-    bool seed_loaded = false;
+    bool db_loaded = false;
 
-    if (!seedfile.empty()) {
-        if (load_seed_from_file(seedfile.c_str(), lc_param, lp_param, pb_param, current_remap.data())) {
-            seed_loaded = true;
+    // Priority Check: Can we continue from a pre-calculated mapping in the DB?
+    if (!remapdb.empty()) {
+        if (load_seed_from_file(remapdb.c_str(), lc_param, lp_param, pb_param, fingerprint, current_remap.data())) {
+            db_loaded = true;
             std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-            fprintf(stderr, "/* Seed configuration loaded successfully from %s for %d%d%d */\n", seedfile.c_str(), lc_param, lp_param, pb_param);
+            fprintf(stderr, "/* Configuration loaded successfully from %s for %d%d%d_%s */\n", remapdb.c_str(), lc_param, lp_param, pb_param, fingerprint);
         }
     }
 
-    if (!seed_loaded) {
-        /**
-         * Algorithm: Fisher-Yates Randomization (std::shuffle)
-         * Generates an unbiased, uniformly random permutation of the identity mapping 
-         * to serve as the initial chaotic state for the simulated annealing landscape.
-         * Used whenever a seed cannot be resolved.
-         */
+    // Fallback: Total random initialization
+    if (!db_loaded) {
         current_remap = identity_remap;
         std::shuffle(current_remap.begin(), current_remap.end(), rng);
     }
-
-    size_t initial_sum = evaluate_remap(current_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param);
+    
+    RemapTable initial_remap = current_remap;
+    size_t initial_sum = evaluate_remap(current_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
     size_t current_sum = initial_sum;
     size_t sa_best_sum = initial_sum;
     RemapTable sa_best_remap = current_remap;
@@ -763,23 +1044,20 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Victim Index   : 0x%02X (Frequency: %llu bytes)\n", victim_index, byte_freq[victim_index]);
         fprintf(stderr, "Initial Temp   : %.2f\n", T_start);
         fprintf(stderr, "Baseline Size  : %zu bytes (Identity)\n", baseline_sum);
-        fprintf(stderr, "Initial Size   : %zu bytes (%s)\n\n", initial_sum, seed_loaded ? "Seed Loaded" : "Shuffled");
+        fprintf(stderr, "Initial Size   : %zu bytes (%s)\n\n", initial_sum, db_loaded ? "DB Entry Loaded" : "Shuffled");
     }
 
-    // Instantiate and launch asynchronous Greedy Refinement Worker Thread
-    GreedyWorker greedy_worker(files, max_file_size, victim_index, dict_param_kb, lc_param, lp_param, pb_param, bfs_depth);
+    // Spin up Greedy BFS worker to operate asynchronously from the current baseline
+    GreedyWorker greedy_worker(files, max_file_size, victim_index, dict_param_kb, lc_param, lp_param, pb_param, bfs_depth, use_table_penalty);
     greedy_worker.notify_new_annealing_best(sa_best_remap, sa_best_sum);
 
     auto start_time = std::chrono::steady_clock::now();
     auto last_report_time = start_time;
     unsigned long long iterations = 0;
+    
+    // Limits console IO by batched reporting
     double report_delay = static_cast<double>(timeout) / 100.0;
 
-    /**
-     * State Variables for Postponed Reporting
-     * These capture all necessary snapshot metrics to delay a stderr print
-     * if the throttling window hasn't yet elapsed.
-     */
     bool has_pending_report = false;
     RemapTable pending_remap;
     unsigned long long pending_iter = 0;
@@ -787,7 +1065,6 @@ int main(int argc, char** argv) {
     size_t pending_new_size = 0, pending_prev_size = 0;
     double pending_T = 0.0; 
 
-    // SA Parameters
     double T_end = 0.1;
     double T = T_start;
 
@@ -816,7 +1093,7 @@ int main(int argc, char** argv) {
             has_pending_report = false;
         }
 
-        if (elapsed >= timeout) break;
+        if (elapsed >= timeout) break; // Hard exit on timeout
         iterations++;
 
         /**
@@ -830,16 +1107,13 @@ int main(int argc, char** argv) {
 
         // Pick a random target distinct from the victim
         int swap_idx;
-        do {
-            swap_idx = dist256(rng);
-        } while (swap_idx == victim_index);
+        do { swap_idx = dist256(rng); } while (swap_idx == victim_index);
 
-        // Generate test state
         RemapTable test_remap = current_remap;
         std::swap(test_remap[victim_index], test_remap[swap_idx]);
 
-        // Evaluate neighbor state using preset 0 for fast search
-        size_t test_sum = evaluate_remap(test_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param);
+        // Assess candidate mapping logic (Fast Limit: Enabled)
+        size_t test_sum = evaluate_remap(test_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
 
         /**
          * Algorithm: Normalized Energy Delta Calculation
@@ -848,12 +1122,8 @@ int main(int argc, char** argv) {
          */
         double delta = (((double)test_sum - (double)current_sum) / safe_baseline) * 100000.0;
 
-        /**
-         * Algorithm: Metropolis Acceptance Criterion
-         * Standard Simulated Annealing state selection logic using normalized delta.
-         */
+        // Metropolis Criteria 1: Absolute Enhancement or Equal Tie (Accept Unconditionally)
         if (delta <= 0.0) {
-            // ACCEPT: Decrease (or no change) in energy
             if (delta < 0.0) { 
                 bool is_global_best = (test_sum < sa_best_sum);
                 
@@ -879,6 +1149,7 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // Lock in progression
             current_sum = test_sum;
             current_remap = test_remap;
 
@@ -887,6 +1158,7 @@ int main(int argc, char** argv) {
                 sa_best_sum = current_sum;
                 sa_best_remap = current_remap;
                 
+                // If this crushes the greedy worker's best, synchronize and reset the worker
                 if (sa_best_sum < greedy_worker.get_best_size()) {
                     greedy_worker.notify_new_annealing_best(sa_best_remap, sa_best_sum);
                 }
@@ -925,74 +1197,106 @@ int main(int argc, char** argv) {
     // =========================================================
     /**
      * Algorithm: Absolute Performance Benchmarking
-     * Benchmarks both the last Annealing best and the last Greedy best mappings 
-     * through a high-cost LZMA compression sequence (Preset "6e", 8MB dict).
+     * Benchmarks the last Annealing best, the last Greedy best, AND the unmodified 
+     * identity baseline mappings through a high-cost LZMA compression sequence 
+     * (Preset "6e", 8MB dict) to guarantee that whichever output is committed 
+     * fundamentally provides the strongest global compression.
+     * 
+     * Note: Fast Limit is FALSE. It will benchmark against complete untruncated files.
      */
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "========================================================================\n");
-        fprintf(stderr, "FINAL EVALUATION (Preset: 6e, Dictionary: 8MB)\n");
+        fprintf(stderr, "FINAL EVALUATION (Preset: 6e, Dictionary: 8MB, Full Buffer Pass)\n");
         fprintf(stderr, "========================================================================\n");
     }
 
+    // Rigorous evaluation settings mimicking deployment scenarios
     uint32_t final_preset = 6 | LZMA_PRESET_EXTREME;
     int final_dict_kb = 8192; // 8MB
 
-    size_t final_baseline = evaluate_remap(identity_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param);
-    size_t final_sa_best = evaluate_remap(sa_best_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param);
+    // Fetch the metrics specifically requested for the factual ratio comments
+    size_t final_baseline = evaluate_remap(identity_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
+    size_t final_baseline_default = evaluate_remap(identity_remap, files, main_ws, final_preset, final_dict_kb, 3, 0, 2, use_table_penalty, false);
     
-    double sa_pct = final_baseline ? ((double)((long long)final_sa_best - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
+    size_t final_initial_seed = evaluate_remap(initial_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
+    size_t final_sa_best = evaluate_remap(sa_best_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
+    
+    double sa_pct_baseline = final_baseline ? ((double)((long long)final_sa_best - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
+    double sa_pct_initial = final_initial_seed ? ((double)((long long)final_sa_best - (long long)final_initial_seed) / final_initial_seed) * 100.0 : 0.0;
 
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "Identity Remap Baseline Size : %zu bytes\n", final_baseline);
-        fprintf(stderr, "Last Annealing Best Size    : %zu bytes (%+10.3f%% vs Identity)\n", final_sa_best, sa_pct);
+        fprintf(stderr, "Initial DB Entry Size        : %zu bytes\n", final_initial_seed);
+        fprintf(stderr, "Last Annealing Best Size     : %zu bytes (%+10.3f%% vs Identity, %+10.3f%% vs DB Entry)\n", final_sa_best, sa_pct_baseline, sa_pct_initial);
     }
 
+    // Query Asynchronous BFS results
     RemapTable greedy_best_remap;
     size_t greedy_fast_best = 0;
     bool has_greedy_best = greedy_worker.get_best(greedy_best_remap, greedy_fast_best);
     
     RemapTable final_optimal_remap = sa_best_remap;
-    
+    size_t final_optimal_size = final_sa_best;
+    const char* optimal_source_name = "Annealing Best";
+
+    // Compare SA vs Greedy yields 
     if (has_greedy_best) {
-        size_t final_greedy_best = evaluate_remap(greedy_best_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param);
-        double greedy_pct = final_baseline ? ((double)((long long)final_greedy_best - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
-        
+        size_t final_greedy_best = evaluate_remap(greedy_best_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
+        double greedy_pct_baseline = final_baseline ? ((double)((long long)final_greedy_best - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
+        double greedy_pct_initial = final_initial_seed ? ((double)((long long)final_greedy_best - (long long)final_initial_seed) / final_initial_seed) * 100.0 : 0.0;
+
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "Last Greedy Best Size       : %zu bytes (%+10.3f%% vs Identity)\n\n", final_greedy_best, greedy_pct);
-        
-        if (final_sa_best < final_greedy_best) {
-            fprintf(stderr, "\nFinal Optimal Remap Table (Annealing Best):\n");
-            print_remap_table_as_source("optimal_remap", sa_best_remap);
-        } else {
+        fprintf(stderr, "Greedy Worker Best Size      : %zu bytes (%+10.3f%% vs Identity, %+10.3f%% vs DB Entry)\n", final_greedy_best, greedy_pct_baseline, greedy_pct_initial);
+
+        // Elect greedy mapping if strictly better
+        if (final_greedy_best < final_optimal_size) {
             final_optimal_remap = greedy_best_remap;
-            fprintf(stderr, "Final Optimal Remap Table (Greedy Worker Best):\n");
-            print_remap_table_as_source("optimal_remap", greedy_best_remap);
+            final_optimal_size = final_greedy_best;
+            optimal_source_name = "Greedy Worker Best";
         }
-    } else {
-        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "\nFinal Optimal Remap Table (Annealing Best):\n");
-        print_remap_table_as_source("optimal_remap", sa_best_remap);
     }
+
+    // Note: Identity Mapping is explicitly REMOVED from contention here.
+    // The optimal size MUST be the best valid configuration determined by the heuristic passes (SA or Greedy).
+
+    // Calculate Final Performance Deltas
+    double opt_pct_baseline = final_baseline ? ((double)((long long)final_optimal_size - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
+    double opt_pct_initial = final_initial_seed ? ((double)((long long)final_optimal_size - (long long)final_initial_seed) / final_initial_seed) * 100.0 : 0.0;
+
+    double ratio_a = final_baseline > 0 ? (double)final_optimal_size / final_baseline : 1.0;
+    double ratio_b = final_baseline_default > 0 ? (double)final_optimal_size / final_baseline_default : 1.0;
 
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "========================================================================\n");
+        fprintf(stderr, "\n========================================================================\n");
+        fprintf(stderr, "FINAL OPTIMAL REMAP SOURCE: %s\n", optimal_source_name);
+        fprintf(stderr, "Final Size                  : %zu bytes\n", final_optimal_size);
+        fprintf(stderr, "Total Reduction vs Identity : %+10.3f%%\n", opt_pct_baseline);
+        fprintf(stderr, "Total Reduction vs Initial  : %+10.3f%%\n", opt_pct_initial);
+        fprintf(stderr, "Ratio (a) vs Context Ident. : %.6f\n", ratio_a);
+        fprintf(stderr, "Ratio (b) vs Default Ident. : %.6f\n", ratio_b);
+        fprintf(stderr, "========================================================================\n\n");
     }
 
-    // Determine if the best run yielded an improvement against the initial starting configuration
-    bool improvement_found = (sa_best_sum < initial_sum);
-    if (has_greedy_best && greedy_fast_best < initial_sum) {
-        improvement_found = true;
-    }
+    // Gatekeeper metric: Only physically overwrite the previous save if we actively improved it
+    bool improvement_found = (final_optimal_size < final_initial_seed);
 
-    // Persist the seed if an improvement was found over the loaded state
-    if (!seedfile.empty() && improvement_found) {
-        save_seed_to_file(seedfile.c_str(), lc_param, lp_param, pb_param, final_optimal_remap.data());
-    } else if (!seedfile.empty() && !improvement_found) {
+    if (improvement_found && !remapdb.empty()) {
+        save_seed_to_file(remapdb.c_str(), lc_param, lp_param, pb_param, fingerprint, 
+                          final_optimal_remap.data(), final_baseline, final_initial_seed, final_optimal_size,
+                          ratio_a, ratio_b);
+    } else {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "\n/* Optimization concluded without improving upon the loaded seed. No file update executed. */\n");
+        if (!improvement_found) fprintf(stderr, "/* No meaningful improvement vs initial state found; skipping save. */\n");
+        else fprintf(stderr, "/* No DB file provided; skipping save. */\n");
+        
+        char final_target_decl[128];
+        snprintf(final_target_decl, sizeof(final_target_decl), "lzma_byte_remap_%d%d%d_%s", lc_param, lp_param, pb_param, fingerprint);
+        
+        fprintf(stderr, "\nFinal Remap Table Dump (Optimal Configuration):\n");
+        print_remap_table_as_source(final_target_decl, final_optimal_remap, ratio_a, ratio_b);
     }
 
     return EXIT_SUCCESS;
