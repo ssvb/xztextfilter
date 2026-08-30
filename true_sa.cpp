@@ -65,7 +65,7 @@
  * 
  * 6. Final Extreme Evaluation & Seed Retention
  *    - Benchmarks the final SA best state and Greedy best state using the LZMA2 
- *      "6e" preset, an 8MB dictionary, and context parameters for maximum compression.
+ *      "6" (or "6e" if --extreme) preset, an 8MB dictionary, and context parameters for maximum compression.
  *    - EXCLUDES the un-mutated identity baseline as a final contender.
  *    - Commits the optimal mapping back to the persistent seed file if it improves 
  *      upon the initial loaded state, prepended with comparative LZMA ratio statistics.
@@ -103,13 +103,13 @@ using RemapTable = std::array<uint8_t, 256>;
 // ------------------------------------------------------------------------------------------
 // Rigid Seed File Parser & Permutation Validator
 // ------------------------------------------------------------------------------------------
-int load_seed_from_file(const char *filename, int lc, int lp, int pb, const char *fingerprint, unsigned char *out_remap) {
+int load_seed_from_file(const char *filename, int lc, int lp, int pb, bool use_extreme, const char *fingerprint, unsigned char *out_remap) {
     FILE *file = fopen(filename, "r");
     if (!file) return 0; // Silently return if file does not exist
 
     char target_decl[128];
-    // Formulate the expected array name based on LZMA parameters and file fingerprint
-    snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d_%s", lc, lp, pb, fingerprint);
+    // Formulate the expected array name based on LZMA parameters, extreme flag, and file fingerprint
+    snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc, lp, pb, use_extreme ? "e" : "", fingerprint);
 
     char line[512];
     int found_decl = 0;
@@ -215,11 +215,11 @@ std::string get_byte_as_source(uint8_t byte) {
 }
 
 // Prints the remap table to stderr in valid C syntax
-void print_remap_table_as_source(const char* var_name, const RemapTable& remap, double ratio_a = 0.0, double ratio_b = 0.0) {
+void print_remap_table_as_source(const char* var_name, const RemapTable& remap, bool print_stats = false, double pct_a = 0.0, double pct_b = 0.0) {
     std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-    if (ratio_a > 0.0) {
-        // Output factual accuracy update: the new float ratios
-        fprintf(stderr, "/* %.6f %.6f */\n", ratio_a, ratio_b);
+    if (print_stats) {
+        // Output factual accuracy update: the new percentage metrics
+        fprintf(stderr, "/* %+.3f%% %+.3f%% */\n", pct_a, pct_b);
     }
     fprintf(stderr, "unsigned char %s[256] = {\n    ", var_name);
     for (int i = 0; i < 256; i++) {
@@ -236,23 +236,23 @@ void print_remap_table_as_source(const char* var_name, const RemapTable& remap, 
  * Algorithm: String-Based Replacement & Ratio Annotation (DB Upgrade)
  * ==============================================================================
  * This function updates the remap db file in-place, modifying the remap table and 
- * updating the factual accuracy of the preceding ratio comment.
+ * updating the factual accuracy of the preceding percentage block comment.
  * 
- * Crucially, it preserves ALL existing comments outside of the targeted float
- * ratio block and the target array itself. 
+ * Crucially, it preserves ALL existing comments outside of the targeted percentage
+ * block and the target array itself. 
  * 
  * 1. Scans forward to find the `lzma_byte_remap_XYZ` declaration.
  * 2. Scans backwards from the declaration to specifically identify and consume 
- *    ONLY the old / * %.6f %.6f * / ratio block. It avoids touching other comments.
+ *    ONLY the old / * %+XX.XXX% %+YY.YYY% * / block. It avoids touching other comments.
  * 3. Utilizes a literal-aware brace search to skip and replace the old array.
- * 4. Injects the updated ratio comment and new mapping array atomically.
+ * 4. Injects the updated percentage comment and new mapping array atomically.
  * 5. Strictly preserves all surrounding whitespace and newlines, ensuring the database
  *    format does not vertically collapse upon multiple rewrites.
  * 6. Ensures exactly one blank line is inserted between independent entries if appending.
  */
-void save_seed_to_file(const char *filepath, int lc, int lp, int pb, const char *fingerprint, 
+void save_seed_to_file(const char *filepath, int lc, int lp, int pb, bool use_extreme, const char *fingerprint, 
                        const uint8_t *best_remap, size_t baseline_size, size_t initial_size, size_t after_size,
-                       double ratio_a, double ratio_b) {
+                       double pct_a, double pct_b) {
     char new_path[1024];
     snprintf(new_path, sizeof(new_path), "%s.new", filepath);
     
@@ -265,13 +265,13 @@ void save_seed_to_file(const char *filepath, int lc, int lp, int pb, const char 
     }
 
     char target_decl[128];
-    snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d_%s", lc, lp, pb, fingerprint);
+    snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc, lp, pb, use_extreme ? "e" : "", fingerprint);
 
     std::string new_content;
     char header[256];
     
-    // Construct the updated factual representation of the ratio comment
-    snprintf(header, sizeof(header), "/* %.6f %.6f */\nunsigned char %s[256] = {\n    ", ratio_a, ratio_b, target_decl);
+    // Construct the updated factual representation of the percentage comment
+    snprintf(header, sizeof(header), "/* %+.3f%% %+.3f%% */\nunsigned char %s[256] = {\n    ", pct_a, pct_b, target_decl);
     new_content += header;
     for (int i = 0; i < 256; i++) {
         new_content += get_byte_as_source(best_remap[i]);
@@ -299,7 +299,7 @@ void save_seed_to_file(const char *filepath, int lc, int lp, int pb, const char 
         // Scrub trailing spaces before the keyword safely
         while (search_pos > 0 && std::isspace(in_str[search_pos - 1])) search_pos--;
         
-        // Strictly target the `/* float float */` pattern for replacement
+        // Strictly target the `/* %+f%% %+f%% */` or older `/* float float */` pattern for replacement
         // This guarantees we only update factual accuracy of the metrics and never
         // remove existing descriptive comments the user may have left.
         if (search_pos >= 2 && in_str[search_pos - 1] == '/' && in_str[search_pos - 2] == '*') {
@@ -307,8 +307,8 @@ void save_seed_to_file(const char *filepath, int lc, int lp, int pb, const char 
             if (comment_start != std::string::npos) {
                 std::string comment_body = in_str.substr(comment_start, search_pos - comment_start);
                 
-                // Heuristic: Ensure it looks like the specific float-ratio comment before absorbing it
-                if (comment_body.find('.') != std::string::npos) {
+                // Heuristic: Ensure it looks like the specific percentage or legacy float block before absorbing it
+                if (comment_body.find('.') != std::string::npos || comment_body.find('%') != std::string::npos) {
                     start_replace = comment_start;
                     // Algorithm Note: Deliberately avoided scouring preceding whitespaces/newlines 
                     // here to preserve exact block separation.
@@ -394,7 +394,7 @@ void save_seed_to_file(const char *filepath, int lc, int lp, int pb, const char 
     RemapTable remap_arr;
     std::memcpy(remap_arr.data(), best_remap, 256);
     fprintf(stderr, "/* Saved Improved Remap Table Dump: */\n");
-    print_remap_table_as_source(target_decl, remap_arr, ratio_a, ratio_b);
+    print_remap_table_as_source(target_decl, remap_arr, true, pct_a, pct_b);
 }
 
 void print_help(const char* prog_name) {
@@ -409,6 +409,7 @@ void print_help(const char* prog_name) {
               << "  --lc=BITS              Set LZMA literal context bits (1-4, default: 3).\n"
               << "  --lp=BITS              Set LZMA literal position bits (0-4, default: 0).\n"
               << "  --pb=BITS              Set LZMA position bits (0-4, default: 2).\n"
+              << "  --extreme              Enable LZMA extreme compression preset during all phases.\n"
               << "  --datasizelimit=BYTES  Set data size limit for fast eval phases (distributed among files).\n"
               << "  --tablepenalty         Add a storage penalty for the remap table to the evaluation.\n"
               << "  --remapdb=FILE         Set persistent file to load/save remap database entries.\n\n";
@@ -538,9 +539,9 @@ public:
     struct BFSNode { uint64_t state; size_t size; int depth; };
 
     GreedyWorker(const std::vector<FileData>& files, size_t max_file_size, int victim_idx,
-                 int dict, int lc, int lp, int pb, int start_bfs_depth, bool use_table_penalty)
+                 uint32_t preset, int dict, int lc, int lp, int pb, int start_bfs_depth, bool use_table_penalty)
         : files_(files), max_file_size_(max_file_size), victim_index_(victim_idx),
-          dict_(dict), lc_(lc), lp_(lp), pb_(pb), start_bfs_depth_(start_bfs_depth),
+          preset_(preset), dict_(dict), lc_(lc), lp_(lp), pb_(pb), start_bfs_depth_(start_bfs_depth),
           use_table_penalty_(use_table_penalty),
           stop_flag_(false), new_task_flag_(false), has_best_(false),
           best_size_(std::numeric_limits<size_t>::max()) 
@@ -722,7 +723,7 @@ again:;
                     std::swap(next_remap[victim_index_], next_remap[i]);
 
                     // Evaluate using the fast-limit flag set to `true`
-                    size_t next_size = evaluate_remap(next_remap, files_, ws, 0, dict_, lc_, lp_, pb_, use_table_penalty_, true);
+                    size_t next_size = evaluate_remap(next_remap, files_, ws, preset_, dict_, lc_, lp_, pb_, use_table_penalty_, true);
 
                     // Strictly Monotonic Criteria (Greedy): Only follow paths <= current state
                     if (next_size <= curr.size) {
@@ -774,6 +775,7 @@ again:;
     const std::vector<FileData>& files_;
     size_t max_file_size_;
     int victim_index_;
+    uint32_t preset_;
     int dict_, lc_, lp_, pb_;
     int start_bfs_depth_;
     bool use_table_penalty_;
@@ -799,6 +801,7 @@ int main(int argc, char** argv) {
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
     size_t datasizelimit = 0;
     bool use_table_penalty = false;
+    bool use_extreme = false;
     std::string remapdb = "";
     std::vector<std::string> filenames;
 
@@ -815,6 +818,7 @@ int main(int argc, char** argv) {
         else if (arg.starts_with("--pb=")) pb_param = std::stoi(argv[i] + 5);
         else if (arg.starts_with("--datasizelimit=")) datasizelimit = std::stoull(argv[i] + 16);
         else if (arg == "--tablepenalty") use_table_penalty = true;
+        else if (arg == "--extreme") use_extreme = true;
         else if (arg.starts_with("--remapdb=")) remapdb = arg.substr(10);
         else filenames.emplace_back(argv[i]);
     }
@@ -998,6 +1002,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "/* Data Fingerprint (Top 3 Hex): %s */\n", fingerprint);
         if (use_table_penalty) fprintf(stderr, "/* Table Penalty Enabled: 1 byte added per broken continuous sequence */\n");
         if (datasizelimit > 0) fprintf(stderr, "/* Data Size Limit: Fast evaluation capped at total %zu bytes across files */\n", datasizelimit);
+        if (use_extreme) fprintf(stderr, "/* Extreme Mode Enabled: Active during all phases */\n");
     }
 
     // Identify lowest frequency byte to act as the primary rotational pivot ("Victim Index")
@@ -1010,8 +1015,11 @@ int main(int argc, char** argv) {
     RemapTable identity_remap;
     for (int i = 0; i < 256; i++) identity_remap[i] = static_cast<uint8_t>(i);
 
+    // Setup Presets Based on User Input (--extreme flag)
+    uint32_t eval_preset = use_extreme ? (6 | LZMA_PRESET_EXTREME) : 6;
+    
     // Initial phase assessments run with the `use_fast_limit = true` flag
-    size_t baseline_sum = evaluate_remap(identity_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
+    size_t baseline_sum = evaluate_remap(identity_remap, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
     double safe_baseline = baseline_sum > 0 ? static_cast<double>(baseline_sum) : 1.0;
 
     RemapTable current_remap;
@@ -1019,10 +1027,10 @@ int main(int argc, char** argv) {
 
     // Priority Check: Can we continue from a pre-calculated mapping in the DB?
     if (!remapdb.empty()) {
-        if (load_seed_from_file(remapdb.c_str(), lc_param, lp_param, pb_param, fingerprint, current_remap.data())) {
+        if (load_seed_from_file(remapdb.c_str(), lc_param, lp_param, pb_param, use_extreme, fingerprint, current_remap.data())) {
             db_loaded = true;
             std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-            fprintf(stderr, "/* Configuration loaded successfully from %s for %d%d%d_%s */\n", remapdb.c_str(), lc_param, lp_param, pb_param, fingerprint);
+            fprintf(stderr, "/* Configuration loaded successfully from %s for %d%d%d%s_%s */\n", remapdb.c_str(), lc_param, lp_param, pb_param, use_extreme ? "e" : "", fingerprint);
         }
     }
 
@@ -1033,7 +1041,7 @@ int main(int argc, char** argv) {
     }
     
     RemapTable initial_remap = current_remap;
-    size_t initial_sum = evaluate_remap(current_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
+    size_t initial_sum = evaluate_remap(current_remap, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
     size_t current_sum = initial_sum;
     size_t sa_best_sum = initial_sum;
     RemapTable sa_best_remap = current_remap;
@@ -1048,7 +1056,7 @@ int main(int argc, char** argv) {
     }
 
     // Spin up Greedy BFS worker to operate asynchronously from the current baseline
-    GreedyWorker greedy_worker(files, max_file_size, victim_index, dict_param_kb, lc_param, lp_param, pb_param, bfs_depth, use_table_penalty);
+    GreedyWorker greedy_worker(files, max_file_size, victim_index, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, bfs_depth, use_table_penalty);
     greedy_worker.notify_new_annealing_best(sa_best_remap, sa_best_sum);
 
     auto start_time = std::chrono::steady_clock::now();
@@ -1113,7 +1121,7 @@ int main(int argc, char** argv) {
         std::swap(test_remap[victim_index], test_remap[swap_idx]);
 
         // Assess candidate mapping logic (Fast Limit: Enabled)
-        size_t test_sum = evaluate_remap(test_remap, files, main_ws, 0, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
+        size_t test_sum = evaluate_remap(test_remap, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
 
         /**
          * Algorithm: Normalized Energy Delta Calculation
@@ -1193,29 +1201,29 @@ int main(int argc, char** argv) {
     greedy_worker.stop();
 
     // =========================================================
-    // FINAL EVALUATION (Extreme Settings) & PERSISTENT SAVE
+    // FINAL EVALUATION (Rigorous Settings) & PERSISTENT SAVE
     // =========================================================
     /**
      * Algorithm: Absolute Performance Benchmarking
      * Benchmarks the last Annealing best, the last Greedy best, AND the unmodified 
      * identity baseline mappings through a high-cost LZMA compression sequence 
-     * (Preset "6e", 8MB dict) to guarantee that whichever output is committed 
-     * fundamentally provides the strongest global compression.
+     * to guarantee that whichever output is committed fundamentally provides the 
+     * strongest global compression.
      * 
      * Note: Fast Limit is FALSE. It will benchmark against complete untruncated files.
      */
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "========================================================================\n");
-        fprintf(stderr, "FINAL EVALUATION (Preset: 6e, Dictionary: 8MB, Full Buffer Pass)\n");
+        fprintf(stderr, "FINAL EVALUATION (Preset: %s, Dictionary: 8MB, Full Buffer Pass)\n", use_extreme ? "6e" : "6");
         fprintf(stderr, "========================================================================\n");
     }
 
     // Rigorous evaluation settings mimicking deployment scenarios
-    uint32_t final_preset = 6 | LZMA_PRESET_EXTREME;
+    uint32_t final_preset = use_extreme ? (6 | LZMA_PRESET_EXTREME) : 6;
     int final_dict_kb = 8192; // 8MB
 
-    // Fetch the metrics specifically requested for the factual ratio comments
+    // Fetch the metrics specifically requested for the factual percentage comments
     size_t final_baseline = evaluate_remap(identity_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
     size_t final_baseline_default = evaluate_remap(identity_remap, files, main_ws, final_preset, final_dict_kb, 3, 0, 2, use_table_penalty, false);
     
@@ -1265,8 +1273,8 @@ int main(int argc, char** argv) {
     double opt_pct_baseline = final_baseline ? ((double)((long long)final_optimal_size - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
     double opt_pct_initial = final_initial_seed ? ((double)((long long)final_optimal_size - (long long)final_initial_seed) / final_initial_seed) * 100.0 : 0.0;
 
-    double ratio_a = final_baseline > 0 ? (double)final_optimal_size / final_baseline : 1.0;
-    double ratio_b = final_baseline_default > 0 ? (double)final_optimal_size / final_baseline_default : 1.0;
+    double pct_a = final_baseline > 0 ? (((double)final_optimal_size - final_baseline) / final_baseline * 100.0) : 0.0;
+    double pct_b = final_baseline_default > 0 ? (((double)final_optimal_size - final_baseline_default) / final_baseline_default * 100.0) : 0.0;
 
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
@@ -1275,8 +1283,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Final Size                  : %zu bytes\n", final_optimal_size);
         fprintf(stderr, "Total Reduction vs Identity : %+10.3f%%\n", opt_pct_baseline);
         fprintf(stderr, "Total Reduction vs Initial  : %+10.3f%%\n", opt_pct_initial);
-        fprintf(stderr, "Ratio (a) vs Context Ident. : %.6f\n", ratio_a);
-        fprintf(stderr, "Ratio (b) vs Default Ident. : %.6f\n", ratio_b);
+        fprintf(stderr, "Difference vs Context Ident.: %+.3f%%\n", pct_a);
+        fprintf(stderr, "Difference vs Default Ident.: %+.3f%%\n", pct_b);
         fprintf(stderr, "========================================================================\n\n");
     }
 
@@ -1284,19 +1292,19 @@ int main(int argc, char** argv) {
     bool improvement_found = (final_optimal_size < final_initial_seed);
 
     if (improvement_found && !remapdb.empty()) {
-        save_seed_to_file(remapdb.c_str(), lc_param, lp_param, pb_param, fingerprint, 
+        save_seed_to_file(remapdb.c_str(), lc_param, lp_param, pb_param, use_extreme, fingerprint, 
                           final_optimal_remap.data(), final_baseline, final_initial_seed, final_optimal_size,
-                          ratio_a, ratio_b);
+                          pct_a, pct_b);
     } else {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         if (!improvement_found) fprintf(stderr, "/* No meaningful improvement vs initial state found; skipping save. */\n");
         else fprintf(stderr, "/* No DB file provided; skipping save. */\n");
         
         char final_target_decl[128];
-        snprintf(final_target_decl, sizeof(final_target_decl), "lzma_byte_remap_%d%d%d_%s", lc_param, lp_param, pb_param, fingerprint);
+        snprintf(final_target_decl, sizeof(final_target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc_param, lp_param, pb_param, use_extreme ? "e" : "", fingerprint);
         
         fprintf(stderr, "\nFinal Remap Table Dump (Optimal Configuration):\n");
-        print_remap_table_as_source(final_target_decl, final_optimal_remap, ratio_a, ratio_b);
+        print_remap_table_as_source(final_target_decl, final_optimal_remap, true, pct_a, pct_b);
     }
 
     return EXIT_SUCCESS;
