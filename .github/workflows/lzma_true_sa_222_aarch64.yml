@@ -24,4 +24,4 @@ jobs:
 
       - name: Run Simulated Annealing (~5.5 Hours)
         run: |
-          ./true_sa --remapdb=remapdb.txt --lc=2 --lp=2 --pb=2 --timeout=20000 --temperature=10000 --datasizelimit=500000 bincode-aarch64-clang-O3 bincode-aarch64-clang-Os
+          ./true_sa --remapdb=remapdb.txt --dict=1024 --lc=2 --lp=2 --pb=2 --timeout=20000 --temperature=10000 --datasizelimit=500000 bincode-aarch64-clang-O3 bincode-aarch64-clang-Os
