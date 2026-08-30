@@ -24,4 +24,4 @@ jobs:
 
       - name: Run Simulated Annealing (~5.5 Hours)
         run: |
-          ./true_sa --lc=3 --lp=1 --pb=1 --timeout=20000 small/texteng.txt small/texteng.html
+          ./true_sa --remapdb=remapdb.txt --lc=3 --lp=1 --pb=1 --timeout=20000 small/texteng.txt small/texteng.html

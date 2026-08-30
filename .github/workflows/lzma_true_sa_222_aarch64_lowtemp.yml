@@ -1,4 +1,4 @@
-name: LZMA2 lc=3,lp=1,pb=0
+name: LZMA2 lc=2,lp=2,pb=2 aarch64
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch: # Allows manual triggering from the UI
 
 jobs:
-  find-new-sa-310:
+  find-new-sa-222-aarch64-lowtemp:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,4 +24,4 @@ jobs:
 
       - name: Run Simulated Annealing (~5.5 Hours)
         run: |
-          ./true_sa --remapdb=remapdb.txt --lc=3 --lp=1 --pb=0 --timeout=20000 small/texteng.txt small/texteng.html
+          ./true_sa --remapdb=remapdb.txt --lc=2 --lp=2 --pb=2 --timeout=20000 --temperature=5 --datasizelimit=500000 bincode-aarch64-clang-O3 bincode-aarch64-clang-Os
