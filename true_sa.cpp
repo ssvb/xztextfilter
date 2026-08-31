@@ -82,6 +82,206 @@ struct FileData {
     size_t fast_eval_size = 0; // The calculated byte limit specifically used during the fast search phase
 };
 
+/**
+ * ==============================================================================
+ * InputFilesManager
+ * ==============================================================================
+ * Responsible for loading the source files from disk, partitioning the data for
+ * fast evaluation phases, and performing all required statistical analysis.
+ */
+class InputFilesManager {
+public:
+    InputFilesManager(const std::vector<std::string>& filenames, size_t initial_limit)
+        : filenames_(filenames), datasizelimit_(initial_limit), max_file_size_(0), victim_index_(0) {}
+
+    bool loadFiles() {
+        files_.resize(filenames_.size());
+        for (size_t i = 0; i < filenames_.size(); i++) {
+            files_[i].filename = filenames_[i];
+            FILE* f = fopen(filenames_[i].c_str(), "rb");
+            if (!f) return false;
+            fseek(f, 0, SEEK_END);
+            files_[i].in_buf.resize(ftell(f));
+            fseek(f, 0, SEEK_SET);
+            if (files_[i].in_buf.size() > max_file_size_) max_file_size_ = files_[i].in_buf.size();
+            if (!files_[i].in_buf.empty() && fread(files_[i].in_buf.data(), 1, files_[i].in_buf.size(), f) != files_[i].in_buf.size()) {
+                fclose(f);
+                return false;
+            }
+            fclose(f);
+        }
+        return true;
+    }
+
+    void analyzeAndAdjustLimit() {
+        apply_water_filling(datasizelimit_);
+
+        /**
+         * Algorithm: Frequency Analysis & Dynamic Victim Index Validation
+         * Iterates over the byte layout of the files to construct a global frequency 
+         * histogram. The index mapping to the lowest frequency becomes the "victim", 
+         * serving as the continuous focal point for swaps in the SA loop.
+         * 
+         * Note: This analyzes the data capped by the `--datasizelimit` option. If the
+         * resulting data fingerprint doesn't match the full untruncated data fingerprint,
+         * it gradually increases the limit to ensure global accuracy of the core mapping.
+         */
+        std::array<unsigned long long, 256> full_freq{};
+        for (const auto& file : files_) {
+            for (uint8_t byte_val : file.in_buf) full_freq[byte_val]++;
+        }
+        std::string full_fingerprint = get_fingerprint(full_freq);
+
+        size_t effective_increase = 0;
+
+        if (datasizelimit_ > 0) {
+            while (true) {
+                byte_freq_.fill(0);
+                for (const auto& file : files_) {
+                    for (size_t i = 0; i < file.fast_eval_size; i++) {
+                        byte_freq_[file.in_buf[i]]++;
+                    }
+                }
+                std::string capped_fingerprint = get_fingerprint(byte_freq_);
+                
+                if (capped_fingerprint == full_fingerprint) {
+                    break; // Match found
+                }
+                
+                if (effective_increase == 0) {
+                    std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+                    fprintf(stderr, "/* Warning: Capped data fingerprint (%s) does not match full data fingerprint (%s). Increasing limit... */\n", capped_fingerprint.c_str(), full_fingerprint.c_str());
+                }
+                
+                size_t total_size = 0;
+                for (const auto& file : files_) total_size += file.in_buf.size();
+                if (datasizelimit_ >= total_size) {
+                    break; // Hard cap at maximum total file size to prevent runaway allocation
+                }
+                
+                datasizelimit_++;
+                effective_increase++;
+                apply_water_filling(datasizelimit_);
+            }
+            
+            if (effective_increase > 0) {
+                std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+                fprintf(stderr, "/* Effective cap increase: %zu bytes (New limit: %zu bytes) */\n", effective_increase, datasizelimit_);
+            }
+        } else {
+            byte_freq_ = full_freq;
+        }
+
+        /**
+         * Algorithm: Global Frequency Ranking, Top-10 Hex, & Fingerprinting
+         * Sorts all byte values (0-255) by occurrence frequency in descending order.
+         * Extracts the 10 most frequent byte values and formats them as a concatenated
+         * two-digit hexadecimal string reported to stderr.
+         * Also extracts the top 3 most frequent bytes to formulate the Data Fingerprint,
+         * resolving and tagging the persistence entries properly.
+         */
+        std::vector<ByteCount> freq_ranked(256);
+        for (int i = 0; i < 256; i++) {
+            freq_ranked[i] = { static_cast<uint8_t>(i), byte_freq_[i] };
+        }
+        std::stable_sort(freq_ranked.begin(), freq_ranked.end(), [](const ByteCount& a, const ByteCount& b) {
+            if (a.count != b.count) return a.count > b.count;
+            return a.byte_val < b.byte_val;
+        });
+
+        char top10_hex_buf[21] = {0};
+        for (int i = 0; i < 10; i++) snprintf(top10_hex_buf + (i * 2), 3, "%02X", freq_ranked[i].byte_val);
+
+        top10_hex_ = std::string(top10_hex_buf);
+        fingerprint_ = full_fingerprint;
+
+        // Identify lowest frequency byte to act as the primary rotational pivot ("Victim Index")
+        victim_index_ = 0;
+        for (int i = 1; i < 256; i++) {
+            if (byte_freq_[i] < byte_freq_[victim_index_]) victim_index_ = i;
+        }
+    }
+
+    // Accessors for utilizing the fully prepped evaluation buffers
+    const std::vector<FileData>& getFiles() const { return files_; }
+    size_t getMaxFileSize() const { return max_file_size_; }
+    size_t getDatasizeLimit() const { return datasizelimit_; }
+    const std::string& getFingerprint() const { return fingerprint_; }
+    const std::string& getTop10Hex() const { return top10_hex_; }
+    int getVictimIndex() const { return victim_index_; }
+    const std::array<unsigned long long, 256>& getByteFreq() const { return byte_freq_; }
+
+private:
+    struct ByteCount {
+        uint8_t byte_val;
+        unsigned long long count;
+    };
+
+    std::vector<std::string> filenames_;
+    std::vector<FileData> files_;
+    size_t datasizelimit_;
+    size_t max_file_size_;
+
+    std::array<unsigned long long, 256> byte_freq_{};
+    std::string fingerprint_;
+    std::string top10_hex_;
+    int victim_index_;
+
+    /**
+     * ==============================================================================
+     * Algorithm: Fair-Share Data Truncation (Water-Filling)
+     * ==============================================================================
+     * To accelerate the evaluation phases (SA and BFS), an optional data size limit 
+     * can be specified. This algorithm fairly distributes that total limit across 
+     * all input files. If a file is naturally smaller than its allocated fair share, 
+     * its unused quota is mathematically cascaded/redistributed to remaining files.
+     * 
+     * 1. Sort files by their actual sizes in ascending order.
+     * 2. Iteratively divide `remaining_limit` by `remaining_files` for the fair share.
+     * 3. Take `min(actual_size, fair_share)` as the current file's allocation.
+     * 4. Subtract the allocation from the remaining limit and proceed.
+     */
+    void apply_water_filling(size_t limit) {
+        if (limit == 0) {
+            for (auto& f : files_) f.fast_eval_size = f.in_buf.size();
+            return;
+        }
+        std::vector<size_t> indices(files_.size());
+        for (size_t i = 0; i < files_.size(); i++) indices[i] = i;
+        
+        // Sort indices by file buffer size in ascending order
+        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            return files_[a].in_buf.size() < files_[b].in_buf.size();
+        });
+        
+        size_t remaining_limit = limit;
+        size_t remaining_files = files_.size();
+        
+        for (size_t idx : indices) {
+            size_t fair_share = remaining_limit / remaining_files;
+            size_t allocation = std::min(files_[idx].in_buf.size(), fair_share);
+            
+            files_[idx].fast_eval_size = allocation;
+            remaining_limit -= allocation;
+            remaining_files--;
+        }
+    }
+
+    static std::string get_fingerprint(const std::array<unsigned long long, 256>& freqs) {
+        std::vector<ByteCount> ranked(256);
+        for (int i = 0; i < 256; i++) {
+            ranked[i] = { static_cast<uint8_t>(i), freqs[i] };
+        }
+        std::stable_sort(ranked.begin(), ranked.end(), [](const ByteCount& a, const ByteCount& b) {
+            if (a.count != b.count) return a.count > b.count;
+            return a.byte_val < b.byte_val;
+        });
+        char fp[7] = {0};
+        for (int i = 0; i < 3; i++) snprintf(fp + (i * 2), 3, "%02X", ranked[i].byte_val);
+        return std::string(fp);
+    }
+};
+
 // Thread-local evaluation workspace to prevent buffer reallocation and race conditions
 struct LZMAWorkspace {
     std::vector<uint8_t> remapped_buf;
@@ -856,183 +1056,35 @@ int main(int argc, char** argv) {
 
     std::mt19937 rng(std::random_device{}());
 
-    std::vector<FileData> files(filenames.size());
-    size_t max_file_size = 0;
-
-    // Load file contents into contiguous memory buffers
-    for (size_t i = 0; i < filenames.size(); i++) {
-        files[i].filename = filenames[i];
-        FILE* f = fopen(filenames[i].c_str(), "rb");
-        if (!f) return EXIT_FAILURE;
-        fseek(f, 0, SEEK_END);
-        files[i].in_buf.resize(ftell(f));
-        fseek(f, 0, SEEK_SET);
-        if (files[i].in_buf.size() > max_file_size) max_file_size = files[i].in_buf.size();
-        if (!files[i].in_buf.empty() && fread(files[i].in_buf.data(), 1, files[i].in_buf.size(), f) != files[i].in_buf.size()) {
-            fclose(f);
-            return EXIT_FAILURE;
-        }
-        fclose(f);
+    // Centralize file loading and statistical analysis in the new manager class
+    InputFilesManager fileManager(filenames, datasizelimit);
+    if (!fileManager.loadFiles()) {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        std::cerr << "Error: Failed to load input files.\n";
+        return EXIT_FAILURE;
     }
 
-    struct ByteCount {
-        uint8_t byte_val;
-        unsigned long long count;
-    };
+    // Executes internal fast-eval water-filling, byte frequency counts, and fingerprint generation
+    fileManager.analyzeAndAdjustLimit();
 
-    /**
-     * ==============================================================================
-     * Algorithm: Fair-Share Data Truncation (Water-Filling)
-     * ==============================================================================
-     * To accelerate the evaluation phases (SA and BFS), an optional data size limit 
-     * can be specified. This algorithm fairly distributes that total limit across 
-     * all input files. If a file is naturally smaller than its allocated fair share, 
-     * its unused quota is mathematically cascaded/redistributed to remaining files.
-     * 
-     * 1. Sort files by their actual sizes in ascending order.
-     * 2. Iteratively divide `remaining_limit` by `remaining_files` for the fair share.
-     * 3. Take `min(actual_size, fair_share)` as the current file's allocation.
-     * 4. Subtract the allocation from the remaining limit and proceed.
-     */
-    auto apply_water_filling = [&](size_t limit) {
-        if (limit == 0) {
-            for (auto& f : files) f.fast_eval_size = f.in_buf.size();
-            return;
-        }
-        std::vector<size_t> indices(files.size());
-        for (size_t i = 0; i < files.size(); i++) indices[i] = i;
-        
-        // Sort indices by file buffer size in ascending order
-        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            return files[a].in_buf.size() < files[b].in_buf.size();
-        });
-        
-        size_t remaining_limit = limit;
-        size_t remaining_files = files.size();
-        
-        for (size_t idx : indices) {
-            size_t fair_share = remaining_limit / remaining_files;
-            size_t allocation = std::min(files[idx].in_buf.size(), fair_share);
-            
-            files[idx].fast_eval_size = allocation;
-            remaining_limit -= allocation;
-            remaining_files--;
-        }
-    };
-
-    apply_water_filling(datasizelimit);
+    const auto& files = fileManager.getFiles();
+    size_t max_file_size = fileManager.getMaxFileSize();
+    int victim_index = fileManager.getVictimIndex();
+    std::string fingerprint = fileManager.getFingerprint();
+    const auto& byte_freq = fileManager.getByteFreq();
+    
+    // Limits could be auto-increased during fingerprint validation; sync state
+    datasizelimit = fileManager.getDatasizeLimit(); 
 
     LZMAWorkspace main_ws(max_file_size);
 
-    /**
-     * Algorithm: Frequency Analysis & Dynamic Victim Index Validation
-     * Iterates over the byte layout of the files to construct a global frequency 
-     * histogram. The index mapping to the lowest frequency becomes the "victim", 
-     * serving as the continuous focal point for swaps in the SA loop.
-     * 
-     * Note: This analyzes the data capped by the `--datasizelimit` option. If the
-     * resulting data fingerprint doesn't match the full untruncated data fingerprint,
-     * it gradually increases the limit to ensure global accuracy of the core mapping.
-     */
-    auto get_fingerprint = [](const std::array<unsigned long long, 256>& freqs) -> std::string {
-        std::vector<ByteCount> ranked(256);
-        for (int i = 0; i < 256; i++) {
-            ranked[i] = { static_cast<uint8_t>(i), freqs[i] };
-        }
-        std::stable_sort(ranked.begin(), ranked.end(), [](const ByteCount& a, const ByteCount& b) {
-            if (a.count != b.count) return a.count > b.count;
-            return a.byte_val < b.byte_val;
-        });
-        char fp[7] = {0};
-        for (int i = 0; i < 3; i++) snprintf(fp + (i * 2), 3, "%02X", ranked[i].byte_val);
-        return std::string(fp);
-    };
-
-    // 1. Calculate Full Data Fingerprint
-    std::array<unsigned long long, 256> full_freq{};
-    for (const auto& file : files) {
-        for (uint8_t byte_val : file.in_buf) full_freq[byte_val]++;
-    }
-    std::string full_fingerprint = get_fingerprint(full_freq);
-
-    // 2. Calculate Capped Frequency & Auto-adjust limit
-    std::array<unsigned long long, 256> byte_freq{};
-    size_t effective_increase = 0;
-
-    if (datasizelimit > 0) {
-        while (true) {
-            byte_freq.fill(0);
-            for (const auto& file : files) {
-                for (size_t i = 0; i < file.fast_eval_size; i++) {
-                    byte_freq[file.in_buf[i]]++;
-                }
-            }
-            std::string capped_fingerprint = get_fingerprint(byte_freq);
-            
-            if (capped_fingerprint == full_fingerprint) {
-                break; // Match found
-            }
-            
-            if (effective_increase == 0) {
-                std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-                fprintf(stderr, "/* Warning: Capped data fingerprint (%s) does not match full data fingerprint (%s). Increasing limit... */\n", capped_fingerprint.c_str(), full_fingerprint.c_str());
-            }
-            
-            size_t total_size = 0;
-            for (const auto& file : files) total_size += file.in_buf.size();
-            if (datasizelimit >= total_size) {
-                break; // Hard cap at maximum total file size to prevent runaway allocation
-            }
-            
-            datasizelimit++;
-            effective_increase++;
-            apply_water_filling(datasizelimit);
-        }
-        
-        if (effective_increase > 0) {
-            std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-            fprintf(stderr, "/* Effective cap increase: %zu bytes (New limit: %zu bytes) */\n", effective_increase, datasizelimit);
-        }
-    } else {
-        byte_freq = full_freq;
-    }
-
-    /**
-     * Algorithm: Global Frequency Ranking, Top-10 Hex, & Fingerprinting
-     * Sorts all byte values (0-255) by occurrence frequency in descending order.
-     * Extracts the 10 most frequent byte values and formats them as a concatenated
-     * two-digit hexadecimal string reported to stderr.
-     * Also extracts the top 3 most frequent bytes to formulate the Data Fingerprint,
-     * resolving and tagging the persistence entries properly.
-     */
-    std::vector<ByteCount> freq_ranked(256);
-    for (int i = 0; i < 256; i++) {
-        freq_ranked[i] = { static_cast<uint8_t>(i), byte_freq[i] };
-    }
-    std::stable_sort(freq_ranked.begin(), freq_ranked.end(), [](const ByteCount& a, const ByteCount& b) {
-        if (a.count != b.count) return a.count > b.count;
-        return a.byte_val < b.byte_val;
-    });
-
-    char top10_hex_buf[21] = {0};
-    for (int i = 0; i < 10; i++) snprintf(top10_hex_buf + (i * 2), 3, "%02X", freq_ranked[i].byte_val);
-
-    // Create 3-byte fingerprint unique to the dataset characteristics
-    std::string fingerprint = full_fingerprint;
-
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "/* Top 10 Most Frequent Bytes (Concatenated Hex): %s */\n", top10_hex_buf);
+        fprintf(stderr, "/* Top 10 Most Frequent Bytes (Concatenated Hex): %s */\n", fileManager.getTop10Hex().c_str());
         fprintf(stderr, "/* Data Fingerprint (Top 3 Hex): %s */\n", fingerprint.c_str());
         if (use_table_penalty) fprintf(stderr, "/* Table Penalty Enabled: 1 byte added per broken continuous sequence */\n");
         if (datasizelimit > 0) fprintf(stderr, "/* Data Size Limit: Fast evaluation capped at total %zu bytes across files */\n", datasizelimit);
         if (use_extreme) fprintf(stderr, "/* Extreme Mode Enabled: Active during all phases */\n");
-    }
-
-    // Identify lowest frequency byte to act as the primary rotational pivot ("Victim Index")
-    int victim_index = 0;
-    for (int i = 1; i < 256; i++) {
-        if (byte_freq[i] < byte_freq[victim_index]) victim_index = i;
     }
 
     // Generate strict 1:1 Identity map benchmark
