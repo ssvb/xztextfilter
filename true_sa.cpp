@@ -781,7 +781,7 @@ void print_help(const char* prog_name) {
               << "  --timeout=SEC          Set timeout in seconds for annealing (default: 600).\n"
               << "  --temperature=FLOAT    Set initial temperature for annealing (default: 50.0).\n"
               << "  --bfs-depth=INT        Set initial max BFS depth for Greedy Refinement (default: 1).\n"
-              << "  --dict=KB              Set LZMA dictionary size in kilobytes (default: 4).\n"
+              << "  --dict=KB              Set LZMA dictionary size in kilobytes (default: 8192).\n"
               << "  --lc=BITS              Set LZMA literal context bits (1-4, default: 3).\n"
               << "  --lp=BITS              Set LZMA literal position bits (0-4, default: 0).\n"
               << "  --pb=BITS              Set LZMA position bits (0-4, default: 2).\n"
@@ -789,6 +789,7 @@ void print_help(const char* prog_name) {
               << "  --chunksize=BYTES      Set chunk size limit for partitioning (default: size of largest file).\n"
               << "  --nchunks=INT          Set number of chunks to use during SA and BFS search (default: 1).\n"
               << "  --tablepenalty         Add a storage penalty for the remap table to the evaluation.\n"
+              << "  --reshuffle            Forcefully reshuffle the initial remap table, ignoring the remapdb entry.\n"
               << "  --remapdb=FILE         Set persistent file to load/save remap database entries.\n\n";
 }
 
@@ -1213,11 +1214,12 @@ int main(int argc, char** argv) {
     int timeout = 600;
     double T_start = 50.0;
     int bfs_depth = 1;
-    int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
+    int dict_param_kb = 8192, lc_param = 3, lp_param = 0, pb_param = 2;
     size_t chunksize = 0;
     size_t nchunks = 1;
     bool use_table_penalty = false;
     bool use_extreme = false;
+    bool force_reshuffle = false;
     std::string remapdb_path = "";
     std::vector<std::string> filenames;
 
@@ -1236,6 +1238,7 @@ int main(int argc, char** argv) {
         else if (arg.starts_with("--nchunks=")) nchunks = std::stoull(argv[i] + 10);
         else if (arg == "--tablepenalty") use_table_penalty = true;
         else if (arg == "--extreme") use_extreme = true;
+        else if (arg == "--reshuffle") force_reshuffle = true;
         else if (arg.starts_with("--remapdb=")) remapdb_path = arg.substr(10);
         else filenames.emplace_back(argv[i]);
     }
@@ -1298,8 +1301,15 @@ int main(int argc, char** argv) {
     
     RemapDatabase remap_db(remapdb_path);
 
-    // Priority Check: Can we continue from a pre-calculated mapping in the DB?
-    if (!remapdb_path.empty()) {
+    /**
+     * Algorithm: Initial State Seeding
+     * Determines the starting point for the Simulated Annealing process.
+     * If a database is provided, it attempts to load an existing optimal state.
+     * If --reshuffle is flagged, it forcefully bypasses the database to explore 
+     * completely new permutations from a newly randomized seed, helping escape 
+     * deep local minima in the persistence file.
+     */
+    if (!remapdb_path.empty() && !force_reshuffle) {
         if (remap_db.load(lc_param, lp_param, pb_param, use_extreme, fingerprint, current_remap)) {
             db_loaded = true;
             std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
@@ -1307,10 +1317,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Fallback: Total random initialization
+    // Fallback or Forced Override: Total random initialization
     if (!db_loaded) {
         current_remap = identity_remap;
         std::shuffle(current_remap.begin(), current_remap.end(), rng);
+        if (force_reshuffle) {
+            std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+            fprintf(stderr, "/* Forced Reshuffle Active: Ignored remap database and initialized a new random state. */\n");
+        }
     }
     
     RemapTable initial_remap = current_remap;
