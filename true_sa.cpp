@@ -100,302 +100,326 @@ struct LZMAWorkspace {
 // Typedef for our 256-byte permutation array
 using RemapTable = std::array<uint8_t, 256>;
 
-// ------------------------------------------------------------------------------------------
-// Rigid Seed File Parser & Permutation Validator
-// ------------------------------------------------------------------------------------------
-int load_seed_from_file(const char *filename, int lc, int lp, int pb, bool use_extreme, const char *fingerprint, unsigned char *out_remap) {
-    FILE *file = fopen(filename, "r");
-    if (!file) return 0; // Silently return if file does not exist
+/**
+ * ==============================================================================
+ * Self-Sufficient DB Handler
+ * ==============================================================================
+ * Handles loading, saving, updating, retrieving, and formatting remap tables.
+ */
+class RemapDatabase {
+public:
+    explicit RemapDatabase(const std::string& filepath) : filepath_(filepath) {}
 
-    char target_decl[128];
     // Formulate the expected array name based on LZMA parameters, extreme flag, and file fingerprint
-    snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc, lp, pb, use_extreme ? "e" : "", fingerprint);
+    static std::string get_declaration_name(int lc, int lp, int pb, bool use_extreme, const std::string& fingerprint) {
+        char target_decl[128];
+        snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc, lp, pb, use_extreme ? "e" : "", fingerprint.c_str());
+        return std::string(target_decl);
+    }
 
-    char line[512];
-    int found_decl = 0;
-
-    // Scan for dynamic target array declaration (Ignores preceding comments)
-    while (fgets(line, sizeof(line), file)) {
-        if (strstr(line, target_decl) != NULL) {
-            found_decl = 1;
-            break;
+    /**
+     * String formatter for robustly handling unified syntax for byte declarations.
+     * Prefers character literals for readable ASCII, falls back to hex for unprintable/control bytes.
+     */
+    static std::string format_byte(uint8_t byte) {
+        char buf[16];
+        if (byte >= 32 && byte <= 126) {
+            if (byte == '\'') return "'\\''";
+            else if (byte == '\\') return "'\\\\'";
+            else { snprintf(buf, sizeof(buf), "'%c' ", byte); return buf; }
+        } else {
+            snprintf(buf, sizeof(buf), "0x%02x", byte);
+            return buf;
         }
     }
 
-    if (!found_decl) {
-        fclose(file);
-        return 0; // Target configuration not found
+    /**
+     * Formats the remap table as a valid C source string buffer.
+     */
+    static std::string format_table(const std::string& var_name, const RemapTable& remap, bool print_stats = false, double pct_a = 0.0, double pct_b = 0.0) {
+        std::ostringstream oss;
+        if (print_stats) {
+            // Output factual accuracy update: the new percentage metrics
+            char stat_buf[128];
+            snprintf(stat_buf, sizeof(stat_buf), "/* %+.3f%% %+.3f%% */\n", pct_a, pct_b);
+            oss << stat_buf;
+        }
+        oss << "unsigned char " << var_name << "[256] = {\n    ";
+        for (int i = 0; i < 256; i++) {
+            oss << format_byte(remap[i]);
+            if (i < 255) oss << ", ";
+            if ((i + 1) % 16 == 0 && i < 255) oss << "\n    ";
+        }
+        oss << "\n};\n";
+        return oss.str();
     }
 
-    // Locate the opening brace for the array payload
-    int in_array = 0;
-    if (strchr(line, '{')) in_array = 1;
-    else {
+    // Rigid Seed File Parser & Permutation Validator
+    bool load(int lc, int lp, int pb, bool use_extreme, const std::string& fingerprint, RemapTable& out_remap) const {
+        if (filepath_.empty()) return false;
+        FILE *file = fopen(filepath_.c_str(), "r");
+        if (!file) return false; // Silently return if file does not exist
+
+        std::string target_decl = get_declaration_name(lc, lp, pb, use_extreme, fingerprint);
+
+        char line[512];
+        int found_decl = 0;
+
+        // Scan for dynamic target array declaration (Ignores preceding comments)
         while (fgets(line, sizeof(line), file)) {
-            if (strchr(line, '{')) {
-                in_array = 1;
+            if (strstr(line, target_decl.c_str()) != NULL) {
+                found_decl = 1;
                 break;
             }
         }
-    }
 
-    if (!in_array) {
+        if (!found_decl) {
+            fclose(file);
+            return false; // Target configuration not found
+        }
+
+        // Locate the opening brace for the array payload
+        int in_array = 0;
+        if (strchr(line, '{')) in_array = 1;
+        else {
+            while (fgets(line, sizeof(line), file)) {
+                if (strchr(line, '{')) {
+                    in_array = 1;
+                    break;
+                }
+            }
+        }
+
+        if (!in_array) {
+            fclose(file);
+            return false; // Malformed declaration
+        }
+
+        // Robust parsing of byte literals, supporting both hex (0x00) and char ('a', '\n') formats
+        int count = 0, c;
+        while (count < 256 && (c = fgetc(file)) != EOF) {
+            if (c == '0') {
+                int next = fgetc(file);
+                if (next == 'x' || next == 'X') {
+                    unsigned int val;
+                    if (fscanf(file, "%2x", &val) == 1) out_remap[count++] = (unsigned char)val;
+                } else ungetc(next, file); 
+            } else if (c == '\'') {
+                int char_val = fgetc(file);
+                if (char_val == '\\') { 
+                    int escaped = fgetc(file);
+                    if (escaped == '\'') char_val = '\'';
+                    else if (escaped == '\\') char_val = '\\';
+                }
+                out_remap[count++] = (unsigned char)char_val;
+                // Consume characters until the closing quote
+                while ((c = fgetc(file)) != EOF && c != '\'') { }
+            } else if (c == '}') break; // End of array detected
+        }
         fclose(file);
-        return 0; // Malformed declaration
-    }
 
-    // Robust parsing of byte literals, supporting both hex (0x00) and char ('a', '\n') formats
-    int count = 0, c;
-    while (count < 256 && (c = fgetc(file)) != EOF) {
-        if (c == '0') {
-            int next = fgetc(file);
-            if (next == 'x' || next == 'X') {
-                unsigned int val;
-                if (fscanf(file, "%2x", &val) == 1) out_remap[count++] = (unsigned char)val;
-            } else ungetc(next, file); 
-        } else if (c == '\'') {
-            int char_val = fgetc(file);
-            if (char_val == '\\') { 
-                int escaped = fgetc(file);
-                if (escaped == '\'') char_val = '\'';
-                else if (escaped == '\\') char_val = '\\';
+        // Validation Phase 1: Ensure exactly 256 bytes were read
+        if (count != 256) {
+            std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+            fprintf(stderr, "Error: Parsed %d bytes, expected 256.\n", count);
+            return false;
+        }
+
+        /**
+         * Algorithm: Validating Permutation
+         * We iterate through the parsed 256-byte array and use a frequency map (boolean array)
+         * to guarantee that all numbers are in the valid range 0-255 with strictly no 
+         * duplications and no skips (a complete bijective permutation of 0-255).
+         */
+        int seen[256] = {0};
+        for (int i = 0; i < 256; i++) {
+            if (seen[out_remap[i]]) {
+                std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+                fprintf(stderr, "Error: DB file array contains duplicate value 0x%02X.\n", out_remap[i]);
+                return false; 
             }
-            out_remap[count++] = (unsigned char)char_val;
-            // Consume characters until the closing quote
-            while ((c = fgetc(file)) != EOF && c != '\'') { }
-        } else if (c == '}') break; // End of array detected
-    }
-    fclose(file);
-
-    // Validation Phase 1: Ensure exactly 256 bytes were read
-    if (count != 256) {
-        fprintf(stderr, "Error: Parsed %d bytes, expected 256.\n", count);
-        return 0;
-    }
-
-    /**
-     * Algorithm: Validating Permutation
-     * We iterate through the parsed 256-byte array and use a frequency map (boolean array)
-     * to guarantee that all numbers are in the valid range 0-255 with strictly no 
-     * duplications and no skips (a complete bijective permutation of 0-255).
-     */
-    int seen[256] = {0};
-    for (int i = 0; i < 256; i++) {
-        if (seen[out_remap[i]]) {
-            fprintf(stderr, "Error: DB file array contains duplicate value 0x%02X.\n", out_remap[i]);
-            return 0; 
+            seen[out_remap[i]] = 1;
         }
-        seen[out_remap[i]] = 1;
-    }
 
-    for (int i = 0; i < 256; i++) {
-        if (!seen[i]) {
-            fprintf(stderr, "Error: DB file array is missing value 0x%02X (skips present).\n", i);
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-/**
- * String formatter for robustly handling unified syntax for byte declarations.
- * Prefers character literals for readable ASCII, falls back to hex for unprintable/control bytes.
- */
-std::string get_byte_as_source(uint8_t byte) {
-    char buf[16];
-    if (byte >= 32 && byte <= 126) {
-        if (byte == '\'') return "'\\''";
-        else if (byte == '\\') return "'\\\\'";
-        else { snprintf(buf, sizeof(buf), "'%c' ", byte); return buf; }
-    } else {
-        snprintf(buf, sizeof(buf), "0x%02x", byte);
-        return buf;
-    }
-}
-
-// Prints the remap table to stderr in valid C syntax
-void print_remap_table_as_source(const char* var_name, const RemapTable& remap, bool print_stats = false, double pct_a = 0.0, double pct_b = 0.0) {
-    std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-    if (print_stats) {
-        // Output factual accuracy update: the new percentage metrics
-        fprintf(stderr, "/* %+.3f%% %+.3f%% */\n", pct_a, pct_b);
-    }
-    fprintf(stderr, "unsigned char %s[256] = {\n    ", var_name);
-    for (int i = 0; i < 256; i++) {
-        fprintf(stderr, "%s", get_byte_as_source(remap[i]).c_str());
-        if (i < 255) fprintf(stderr, ", ");
-        if ((i + 1) % 16 == 0 && i < 255) fprintf(stderr, "\n    ");
-    }
-    fprintf(stderr, "\n};\n");
-    fflush(stderr); 
-}
-
-/**
- * ==============================================================================
- * Algorithm: String-Based Replacement & Ratio Annotation (DB Upgrade)
- * ==============================================================================
- * This function updates the remap db file in-place, modifying the remap table and 
- * updating the factual accuracy of the preceding percentage block comment.
- * 
- * Crucially, it preserves ALL existing comments outside of the targeted percentage
- * block and the target array itself. 
- * 
- * 1. Scans forward to find the `lzma_byte_remap_XYZ` declaration.
- * 2. Scans backwards from the declaration to specifically identify and consume 
- *    ONLY the old / * %+XX.XXX% %+YY.YYY% * / block. It avoids touching other comments.
- * 3. Utilizes a literal-aware brace search to skip and replace the old array.
- * 4. Injects the updated percentage comment and new mapping array atomically.
- * 5. Strictly preserves all surrounding whitespace and newlines, ensuring the database
- *    format does not vertically collapse upon multiple rewrites.
- * 6. Ensures exactly one blank line is inserted between independent entries if appending.
- */
-void save_seed_to_file(const char *filepath, int lc, int lp, int pb, bool use_extreme, const char *fingerprint, 
-                       const uint8_t *best_remap, size_t baseline_size, size_t initial_size, size_t after_size,
-                       double pct_a, double pct_b) {
-    char new_path[1024];
-    snprintf(new_path, sizeof(new_path), "%s.new", filepath);
-    
-    // Load entire file into a std::string to facilitate safe substring manipulation
-    std::ifstream ifs(filepath);
-    std::string in_str;
-    if (ifs) {
-        in_str.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-        ifs.close();
-    }
-
-    char target_decl[128];
-    snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc, lp, pb, use_extreme ? "e" : "", fingerprint);
-
-    std::string new_content;
-    char header[256];
-    
-    // Construct the updated factual representation of the percentage comment
-    snprintf(header, sizeof(header), "/* %+.3f%% %+.3f%% */\nunsigned char %s[256] = {\n    ", pct_a, pct_b, target_decl);
-    new_content += header;
-    for (int i = 0; i < 256; i++) {
-        new_content += get_byte_as_source(best_remap[i]);
-        if (i < 255) new_content += ((i + 1) % 16 == 0) ? ",\n    " : ", ";
-    }
-    
-    /**
-     * Algorithm: Strict Replacement Bounds
-     * Prevent vertical collapse by NOT including a trailing newline in the replacement 
-     * payload. We are performing an exact surgical swap from the comment's opening slash
-     * to the array's closing semicolon.
-     */
-    new_content += "\n};";
-
-    size_t decl_pos = in_str.find(target_decl);
-    
-    if (decl_pos != std::string::npos) {
-        // Step backwards to find the "unsigned" keyword
-        size_t unsigned_pos = in_str.rfind("unsigned", decl_pos);
-        if (unsigned_pos == std::string::npos) unsigned_pos = decl_pos;
-        
-        size_t start_replace = unsigned_pos;
-        size_t search_pos = unsigned_pos;
-        
-        // Scrub trailing spaces before the keyword safely
-        while (search_pos > 0 && std::isspace(in_str[search_pos - 1])) search_pos--;
-        
-        // Strictly target the `/* %+f%% %+f%% */` or older `/* float float */` pattern for replacement
-        // This guarantees we only update factual accuracy of the metrics and never
-        // remove existing descriptive comments the user may have left.
-        if (search_pos >= 2 && in_str[search_pos - 1] == '/' && in_str[search_pos - 2] == '*') {
-            size_t comment_start = in_str.rfind("/*", search_pos - 2);
-            if (comment_start != std::string::npos) {
-                std::string comment_body = in_str.substr(comment_start, search_pos - comment_start);
-                
-                // Heuristic: Ensure it looks like the specific percentage or legacy float block before absorbing it
-                if (comment_body.find('.') != std::string::npos || comment_body.find('%') != std::string::npos) {
-                    start_replace = comment_start;
-                    // Algorithm Note: Deliberately avoided scouring preceding whitespaces/newlines 
-                    // here to preserve exact block separation.
-                }
+        for (int i = 0; i < 256; i++) {
+            if (!seen[i]) {
+                std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+                fprintf(stderr, "Error: DB file array is missing value 0x%02X (skips present).\n", i);
+                return false;
             }
         }
 
-        // Fast-forward Literal-aware parser to find proper closing bracket of the array
-        size_t end_replace = decl_pos;
-        size_t open_brace = in_str.find('{', end_replace);
-        if (open_brace != std::string::npos) {
-            bool in_char_literal = false;
-            bool in_escape = false;
+        return true;
+    }
+
+    /**
+     * ==============================================================================
+     * Algorithm: String-Based Replacement & Ratio Annotation (DB Upgrade)
+     * ==============================================================================
+     * This function updates the remap db file in-place, modifying the remap table and 
+     * updating the factual accuracy of the preceding percentage block comment.
+     * 
+     * Crucially, it preserves ALL existing comments outside of the targeted percentage
+     * block and the target array itself. 
+     * 
+     * 1. Scans forward to find the `lzma_byte_remap_XYZ` declaration.
+     * 2. Scans backwards from the declaration to specifically identify and consume 
+     *    ONLY the old / * %+XX.XXX% %+YY.YYY% * / block. It avoids touching other comments.
+     * 3. Utilizes a literal-aware brace search to skip and replace the old array.
+     * 4. Injects the updated percentage comment and new mapping array atomically.
+     * 5. Strictly preserves all surrounding whitespace and newlines, ensuring the database
+     *    format does not vertically collapse upon multiple rewrites.
+     * 6. Ensures exactly one blank line is inserted between independent entries if appending.
+     */
+    void save(int lc, int lp, int pb, bool use_extreme, const std::string& fingerprint, 
+              const RemapTable& best_remap, size_t baseline_size, size_t initial_size, size_t after_size,
+              double pct_a, double pct_b) const {
+        if (filepath_.empty()) return;
+
+        std::string new_path = filepath_ + ".new";
+        
+        // Load entire file into a std::string to facilitate safe substring manipulation
+        std::ifstream ifs(filepath_);
+        std::string in_str;
+        if (ifs) {
+            in_str.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            ifs.close();
+        }
+
+        std::string target_decl = get_declaration_name(lc, lp, pb, use_extreme, fingerprint);
+
+        std::string new_content;
+        char header[256];
+        
+        // Construct the updated factual representation of the percentage comment
+        snprintf(header, sizeof(header), "/* %+.3f%% %+.3f%% */\nunsigned char %s[256] = {\n    ", pct_a, pct_b, target_decl.c_str());
+        new_content += header;
+        for (int i = 0; i < 256; i++) {
+            new_content += format_byte(best_remap[i]);
+            if (i < 255) new_content += ((i + 1) % 16 == 0) ? ",\n    " : ", ";
+        }
+        
+        /**
+         * Algorithm: Strict Replacement Bounds
+         * Prevent vertical collapse by NOT including a trailing newline in the replacement 
+         * payload. We are performing an exact surgical swap from the comment's opening slash
+         * to the array's closing semicolon.
+         */
+        new_content += "\n};";
+
+        size_t decl_pos = in_str.find(target_decl);
+        
+        if (decl_pos != std::string::npos) {
+            // Step backwards to find the "unsigned" keyword
+            size_t unsigned_pos = in_str.rfind("unsigned", decl_pos);
+            if (unsigned_pos == std::string::npos) unsigned_pos = decl_pos;
             
-            // Iterate safely to avoid matching braces inside character literals (e.g. '{')
-            for (size_t i = open_brace; i < in_str.size(); i++) {
-                char c = in_str[i];
-                if (!in_char_literal) {
-                    if (c == '\'') in_char_literal = true;
-                    else if (c == '}') {
-                        end_replace = i;
-                        break;
+            size_t start_replace = unsigned_pos;
+            size_t search_pos = unsigned_pos;
+            
+            // Scrub trailing spaces before the keyword safely
+            while (search_pos > 0 && std::isspace(in_str[search_pos - 1])) search_pos--;
+            
+            // Strictly target the `/* %+f%% %+f%% */` or older `/* float float */` pattern for replacement
+            // This guarantees we only update factual accuracy of the metrics and never
+            // remove existing descriptive comments the user may have left.
+            if (search_pos >= 2 && in_str[search_pos - 1] == '/' && in_str[search_pos - 2] == '*') {
+                size_t comment_start = in_str.rfind("/*", search_pos - 2);
+                if (comment_start != std::string::npos) {
+                    std::string comment_body = in_str.substr(comment_start, search_pos - comment_start);
+                    
+                    // Heuristic: Ensure it looks like the specific percentage or legacy float block before absorbing it
+                    if (comment_body.find('.') != std::string::npos || comment_body.find('%') != std::string::npos) {
+                        start_replace = comment_start;
+                        // Algorithm Note: Deliberately avoided scouring preceding whitespaces/newlines 
+                        // here to preserve exact block separation.
                     }
-                } else {
-                    if (in_escape) in_escape = false;
-                    else if (c == '\\') in_escape = true;
-                    else if (c == '\'') in_char_literal = false;
                 }
             }
-            
-            // Consume the trailing semicolon if present
-            size_t semi = in_str.find(';', end_replace);
-            if (semi != std::string::npos && semi - end_replace < 10) end_replace = semi + 1;
-            else end_replace++;
-            
-            // Algorithm Note: Deliberately avoided cleaning up trailing newlines here
-            // to maintain original formatting and whitespace boundaries.
-        }
-        
-        // Execute the atomic replacement of the targeted float comment and array
-        in_str.replace(start_replace, end_replace - start_replace, new_content);
-    } else {
-        // If the declaration wasn't found, safely append to the end of the file
-        // Ensure an empty line gap between different entries.
-        if (!in_str.empty()) {
-            size_t trailing_newlines = 0;
-            for (auto it = in_str.rbegin(); it != in_str.rend() && *it == '\n'; ++it) {
-                trailing_newlines++;
+
+            // Fast-forward Literal-aware parser to find proper closing bracket of the array
+            size_t end_replace = decl_pos;
+            size_t open_brace = in_str.find('{', end_replace);
+            if (open_brace != std::string::npos) {
+                bool in_char_literal = false;
+                bool in_escape = false;
+                
+                // Iterate safely to avoid matching braces inside character literals (e.g. '{')
+                for (size_t i = open_brace; i < in_str.size(); i++) {
+                    char c = in_str[i];
+                    if (!in_char_literal) {
+                        if (c == '\'') in_char_literal = true;
+                        else if (c == '}') {
+                            end_replace = i;
+                            break;
+                        }
+                    } else {
+                        if (in_escape) in_escape = false;
+                        else if (c == '\\') in_escape = true;
+                        else if (c == '\'') in_char_literal = false;
+                    }
+                }
+                
+                // Consume the trailing semicolon if present
+                size_t semi = in_str.find(';', end_replace);
+                if (semi != std::string::npos && semi - end_replace < 10) end_replace = semi + 1;
+                else end_replace++;
+                
+                // Algorithm Note: Deliberately avoided cleaning up trailing newlines here
+                // to maintain original formatting and whitespace boundaries.
             }
-            if (trailing_newlines == 0) in_str += "\n\n";
-            else if (trailing_newlines == 1) in_str += "\n";
+            
+            // Execute the atomic replacement of the targeted float comment and array
+            in_str.replace(start_replace, end_replace - start_replace, new_content);
+        } else {
+            // If the declaration wasn't found, safely append to the end of the file
+            // Ensure an empty line gap between different entries.
+            if (!in_str.empty()) {
+                size_t trailing_newlines = 0;
+                for (auto it = in_str.rbegin(); it != in_str.rend() && *it == '\n'; ++it) {
+                    trailing_newlines++;
+                }
+                if (trailing_newlines == 0) in_str += "\n\n";
+                else if (trailing_newlines == 1) in_str += "\n";
+            }
+            // Safely re-attach the newline during standard appending operations
+            in_str += new_content + "\n";
         }
-        // Safely re-attach the newline during standard appending operations
-        in_str += new_content + "\n";
+
+        std::ofstream out(new_path);
+        if (!out) {
+            std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+            fprintf(stderr, "/* Error: Could not open temp file '%s' for writing. */\n", new_path.c_str());
+            return;
+        }
+        out << in_str;
+        out.close();
+
+        // Atomic rename ensures file integrity even if the process is interrupted
+        if (rename(new_path.c_str(), filepath_.c_str()) != 0) {
+            std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+            fprintf(stderr, "\n/* Error: Failed to atomically rename '%s' to '%s'. */\n\n", new_path.c_str(), filepath_.c_str());
+        } else {
+            std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+            
+            // Log detailed metrics to console upon successful persistence
+            double pct_change_baseline = baseline_size ? ((double)((long long)after_size - (long long)baseline_size) / baseline_size) * 100.0 : 0.0;
+            double pct_change_initial = initial_size ? ((double)((long long)after_size - (long long)initial_size) / initial_size) * 100.0 : 0.0;
+            
+            fprintf(stderr, "\n/* Successfully saved optimized configuration to DB: %s */\n", filepath_.c_str());
+            fprintf(stderr, "/* Compression Improvement vs Identity Mapping : %zu bytes -> %zu bytes (%+10.3f%%) */\n", baseline_size, after_size, pct_change_baseline);
+            fprintf(stderr, "/* Compression Improvement vs Initial State    : %zu bytes -> %zu bytes (%+10.3f%%) */\n\n", initial_size, after_size, pct_change_initial);
+        }
+
+        // Dump final payload mapping to console for user visibility
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "/* Saved Improved Remap Table Dump: */\n%s", 
+                format_table(target_decl, best_remap, true, pct_a, pct_b).c_str());
     }
 
-    std::ofstream out(new_path);
-    if (!out) {
-        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "/* Error: Could not open temp file '%s' for writing. */\n", new_path);
-        return;
-    }
-    out << in_str;
-    out.close();
-
-    // Atomic rename ensures file integrity even if the process is interrupted
-    if (rename(new_path, filepath) != 0) {
-        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        fprintf(stderr, "\n/* Error: Failed to atomically rename '%s' to '%s'. */\n\n", new_path, filepath);
-    } else {
-        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-        
-        // Log detailed metrics to console upon successful persistence
-        double pct_change_baseline = baseline_size ? ((double)((long long)after_size - (long long)baseline_size) / baseline_size) * 100.0 : 0.0;
-        double pct_change_initial = initial_size ? ((double)((long long)after_size - (long long)initial_size) / initial_size) * 100.0 : 0.0;
-        
-        fprintf(stderr, "\n/* Successfully saved optimized configuration to DB: %s */\n", filepath);
-        fprintf(stderr, "/* Compression Improvement vs Identity Mapping : %zu bytes -> %zu bytes (%+10.3f%%) */\n", baseline_size, after_size, pct_change_baseline);
-        fprintf(stderr, "/* Compression Improvement vs Initial State    : %zu bytes -> %zu bytes (%+10.3f%%) */\n\n", initial_size, after_size, pct_change_initial);
-    }
-
-    // Dump final payload mapping to console for user visibility
-    RemapTable remap_arr;
-    std::memcpy(remap_arr.data(), best_remap, 256);
-    fprintf(stderr, "/* Saved Improved Remap Table Dump: */\n");
-    print_remap_table_as_source(target_decl, remap_arr, true, pct_a, pct_b);
-}
+private:
+    std::string filepath_;
+};
 
 void print_help(const char* prog_name) {
     std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
@@ -520,8 +544,8 @@ void report_improvement(const RemapTable& remap, unsigned long long iter, double
     fprintf(stderr, "P(Accept) for Regressions     : +0.01%%: %.8f | +0.1%%: %.8f | +1%%: %.8f\n", 
             prob_0_01, prob_0_10, prob_1_00);
 
-    fprintf(stderr, "\nCurrent Remap Table Dump:\n");
-    print_remap_table_as_source("current_remap", remap);
+    fprintf(stderr, "\nCurrent Remap Table Dump:\n%s", 
+            RemapDatabase::format_table("current_remap", remap).c_str());
     fprintf(stderr, "========================================================================\n\n");
 }
 
@@ -746,14 +770,15 @@ again:;
                             fprintf(stderr, "New Greedy Best Size                  : %zu bytes\n", next_size);
                             fprintf(stderr, "Absolute Byte Saved vs Start Baseline : %lld bytes\n", (long long)start_task.size - (long long)next_size);
 
-                            fprintf(stderr, "\nInitial State Worker Started From:\n");
-                            print_remap_table_as_source("initial_state_remap", start_task.remap);
+                            fprintf(stderr, "\nInitial State Worker Started From:\n%s", 
+                                    RemapDatabase::format_table("initial_state_remap", start_task.remap).c_str());
                             if (start_task.remap != current_root_task.remap) {
-                                fprintf(stderr, "\nCurrent BFS Checkpoint:\n");
-                                print_remap_table_as_source("bfs_checkpoint_remap", current_root_task.remap);
+                                fprintf(stderr, "\nCurrent BFS Checkpoint:\n%s", 
+                                        RemapDatabase::format_table("bfs_checkpoint_remap", current_root_task.remap).c_str());
                             }
-                            fprintf(stderr, "\nCurrent Greedy Best Remap Table Dump (%d steps from start):\n", cumulative_depth + next_depth);
-                            print_remap_table_as_source("greedy_best_remap", next_remap);
+                            fprintf(stderr, "\nCurrent Greedy Best Remap Table Dump (%d steps from start):\n%s", 
+                                    cumulative_depth + next_depth, 
+                                    RemapDatabase::format_table("greedy_best_remap", next_remap).c_str());
                             fprintf(stderr, "========================================================================\n\n");
                         }
 
@@ -802,7 +827,7 @@ int main(int argc, char** argv) {
     size_t datasizelimit = 0;
     bool use_table_penalty = false;
     bool use_extreme = false;
-    std::string remapdb = "";
+    std::string remapdb_path = "";
     std::vector<std::string> filenames;
 
     // Command Line Argument Parsing
@@ -819,7 +844,7 @@ int main(int argc, char** argv) {
         else if (arg.starts_with("--datasizelimit=")) datasizelimit = std::stoull(argv[i] + 16);
         else if (arg == "--tablepenalty") use_table_penalty = true;
         else if (arg == "--extreme") use_extreme = true;
-        else if (arg.starts_with("--remapdb=")) remapdb = arg.substr(10);
+        else if (arg.starts_with("--remapdb=")) remapdb_path = arg.substr(10);
         else filenames.emplace_back(argv[i]);
     }
 
@@ -993,13 +1018,12 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 10; i++) snprintf(top10_hex_buf + (i * 2), 3, "%02X", freq_ranked[i].byte_val);
 
     // Create 3-byte fingerprint unique to the dataset characteristics
-    char fingerprint[7] = {0};
-    for (int i = 0; i < 3; i++) snprintf(fingerprint + (i * 2), 3, "%02X", freq_ranked[i].byte_val);
+    std::string fingerprint = full_fingerprint;
 
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "/* Top 10 Most Frequent Bytes (Concatenated Hex): %s */\n", top10_hex_buf);
-        fprintf(stderr, "/* Data Fingerprint (Top 3 Hex): %s */\n", fingerprint);
+        fprintf(stderr, "/* Data Fingerprint (Top 3 Hex): %s */\n", fingerprint.c_str());
         if (use_table_penalty) fprintf(stderr, "/* Table Penalty Enabled: 1 byte added per broken continuous sequence */\n");
         if (datasizelimit > 0) fprintf(stderr, "/* Data Size Limit: Fast evaluation capped at total %zu bytes across files */\n", datasizelimit);
         if (use_extreme) fprintf(stderr, "/* Extreme Mode Enabled: Active during all phases */\n");
@@ -1024,13 +1048,15 @@ int main(int argc, char** argv) {
 
     RemapTable current_remap;
     bool db_loaded = false;
+    
+    RemapDatabase remap_db(remapdb_path);
 
     // Priority Check: Can we continue from a pre-calculated mapping in the DB?
-    if (!remapdb.empty()) {
-        if (load_seed_from_file(remapdb.c_str(), lc_param, lp_param, pb_param, use_extreme, fingerprint, current_remap.data())) {
+    if (!remapdb_path.empty()) {
+        if (remap_db.load(lc_param, lp_param, pb_param, use_extreme, fingerprint, current_remap)) {
             db_loaded = true;
             std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-            fprintf(stderr, "/* Configuration loaded successfully from %s for %d%d%d%s_%s */\n", remapdb.c_str(), lc_param, lp_param, pb_param, use_extreme ? "e" : "", fingerprint);
+            fprintf(stderr, "/* Configuration loaded successfully from %s for %d%d%d%s_%s */\n", remapdb_path.c_str(), lc_param, lp_param, pb_param, use_extreme ? "e" : "", fingerprint.c_str());
         }
     }
 
@@ -1291,20 +1317,19 @@ int main(int argc, char** argv) {
     // Gatekeeper metric: Only physically overwrite the previous save if we actively improved it
     bool improvement_found = (final_optimal_size < final_initial_seed);
 
-    if (improvement_found && !remapdb.empty()) {
-        save_seed_to_file(remapdb.c_str(), lc_param, lp_param, pb_param, use_extreme, fingerprint, 
-                          final_optimal_remap.data(), final_baseline, final_initial_seed, final_optimal_size,
-                          pct_a, pct_b);
+    if (improvement_found && !remapdb_path.empty()) {
+        remap_db.save(lc_param, lp_param, pb_param, use_extreme, fingerprint, 
+                      final_optimal_remap, final_baseline, final_initial_seed, final_optimal_size,
+                      pct_a, pct_b);
     } else {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         if (!improvement_found) fprintf(stderr, "/* No meaningful improvement vs initial state found; skipping save. */\n");
         else fprintf(stderr, "/* No DB file provided; skipping save. */\n");
         
-        char final_target_decl[128];
-        snprintf(final_target_decl, sizeof(final_target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc_param, lp_param, pb_param, use_extreme ? "e" : "", fingerprint);
+        std::string final_target_decl = RemapDatabase::get_declaration_name(lc_param, lp_param, pb_param, use_extreme, fingerprint);
         
-        fprintf(stderr, "\nFinal Remap Table Dump (Optimal Configuration):\n");
-        print_remap_table_as_source(final_target_decl, final_optimal_remap, true, pct_a, pct_b);
+        fprintf(stderr, "\nFinal Remap Table Dump (Optimal Configuration):\n%s", 
+                RemapDatabase::format_table(final_target_decl, final_optimal_remap, true, pct_a, pct_b).c_str());
     }
 
     return EXIT_SUCCESS;
