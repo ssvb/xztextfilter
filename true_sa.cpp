@@ -79,20 +79,29 @@ static std::recursive_mutex stderr_mtx;
 struct FileData {
     std::string filename;
     std::vector<uint8_t> in_buf;
-    size_t fast_eval_size = 0; // The calculated byte limit specifically used during the fast search phase
 };
 
 /**
  * ==============================================================================
  * InputFilesManager
  * ==============================================================================
- * Responsible for loading the source files from disk, partitioning the data for
- * fast evaluation phases, and performing all required statistical analysis.
+ * Responsible for loading the source files from disk, partitioning the data into
+ * chunks for fast evaluation phases, and performing all required statistical analysis.
  */
 class InputFilesManager {
 public:
-    InputFilesManager(const std::vector<std::string>& filenames, size_t initial_limit)
-        : filenames_(filenames), datasizelimit_(initial_limit), max_file_size_(0), victim_index_(0) {}
+    struct FilePortion {
+        size_t offset = 0;
+        size_t size = 0;
+    };
+
+    struct Chunk {
+        size_t total_size = 0;
+        std::vector<FilePortion> portions; // Portions contributed by each file
+    };
+
+    InputFilesManager(const std::vector<std::string>& filenames, size_t initial_chunksize, size_t nchunks, int lp, int pb)
+        : filenames_(filenames), chunksize_(initial_chunksize), nchunks_(nchunks), lp_(lp), pb_(pb), max_file_size_(0), victim_index_(0) {}
 
     bool loadFiles() {
         files_.resize(filenames_.size());
@@ -113,8 +122,22 @@ public:
         return true;
     }
 
-    void analyzeAndAdjustLimit() {
-        apply_water_filling(datasizelimit_);
+    void analyzeAndPartition() {
+        // Default chunk size is the size of the largest input file
+        if (chunksize_ == 0) {
+            chunksize_ = max_file_size_ > 0 ? max_file_size_ : 1;
+        }
+
+        size_t total_data_size = 0;
+        for (const auto& file : files_) total_data_size += file.in_buf.size();
+
+        size_t alignment = 1ULL << std::max(lp_, pb_);
+
+        // Perform partitioning adhering to Rules 1-4
+        partition_data(total_data_size, alignment);
+
+        // Report total number of chunks and detailed files to chunks partitioning layout to stderr
+        report_partitioning(alignment);
 
         /**
          * Algorithm: Frequency Analysis & Dynamic Victim Index Validation
@@ -122,9 +145,9 @@ public:
          * histogram. The index mapping to the lowest frequency becomes the "victim", 
          * serving as the continuous focal point for swaps in the SA loop.
          * 
-         * Note: This analyzes the data capped by the `--datasizelimit` option. If the
-         * resulting data fingerprint doesn't match the full untruncated data fingerprint,
-         * it gradually increases the limit to ensure global accuracy of the core mapping.
+         * Note: This analyzes the data covered by the evaluation chunks defined by `--nchunks`.
+         * If the resulting data fingerprint doesn't match the full untruncated data fingerprint,
+         * it gradually increases the evaluation chunk count to ensure global accuracy of the core mapping.
          */
         std::array<unsigned long long, 256> full_freq{};
         for (const auto& file : files_) {
@@ -134,12 +157,16 @@ public:
 
         size_t effective_increase = 0;
 
-        if (datasizelimit_ > 0) {
+        if (nchunks_ < chunks_.size()) {
             while (true) {
                 byte_freq_.fill(0);
-                for (const auto& file : files_) {
-                    for (size_t i = 0; i < file.fast_eval_size; i++) {
-                        byte_freq_[file.in_buf[i]]++;
+                size_t eval_chunks = std::min(nchunks_, chunks_.size());
+                for (size_t k = 0; k < eval_chunks; k++) {
+                    for (size_t i = 0; i < files_.size(); i++) {
+                        const auto& p = chunks_[k].portions[i];
+                        for (size_t j = 0; j < p.size; j++) {
+                            byte_freq_[files_[i].in_buf[p.offset + j]]++;
+                        }
                     }
                 }
                 std::string capped_fingerprint = get_fingerprint(byte_freq_);
@@ -150,23 +177,20 @@ public:
                 
                 if (effective_increase == 0) {
                     std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-                    fprintf(stderr, "/* Warning: Capped data fingerprint (%s) does not match full data fingerprint (%s). Increasing limit... */\n", capped_fingerprint.c_str(), full_fingerprint.c_str());
+                    fprintf(stderr, "/* Warning: Capped data fingerprint (%s) does not match full data fingerprint (%s). Increasing chunk count... */\n", capped_fingerprint.c_str(), full_fingerprint.c_str());
                 }
                 
-                size_t total_size = 0;
-                for (const auto& file : files_) total_size += file.in_buf.size();
-                if (datasizelimit_ >= total_size) {
-                    break; // Hard cap at maximum total file size to prevent runaway allocation
+                if (nchunks_ >= chunks_.size()) {
+                    break; // Hard cap at maximum total chunks
                 }
                 
-                datasizelimit_++;
+                nchunks_++;
                 effective_increase++;
-                apply_water_filling(datasizelimit_);
             }
             
             if (effective_increase > 0) {
                 std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-                fprintf(stderr, "/* Effective cap increase: %zu bytes (New limit: %zu bytes) */\n", effective_increase, datasizelimit_);
+                fprintf(stderr, "/* Effective chunk count increase: %zu (New evaluation chunk count: %zu) */\n", effective_increase, nchunks_);
             }
         } else {
             byte_freq_ = full_freq;
@@ -202,10 +226,12 @@ public:
         }
     }
 
-    // Accessors for utilizing the fully prepped evaluation buffers
+    // Accessors for utilizing the fully prepped evaluation buffers and chunks
     const std::vector<FileData>& getFiles() const { return files_; }
+    const std::vector<Chunk>& getChunks() const { return chunks_; }
     size_t getMaxFileSize() const { return max_file_size_; }
-    size_t getDatasizeLimit() const { return datasizelimit_; }
+    size_t getChunkSize() const { return chunksize_; }
+    size_t getNChunks() const { return nchunks_; }
     const std::string& getFingerprint() const { return fingerprint_; }
     const std::string& getTop10Hex() const { return top10_hex_; }
     int getVictimIndex() const { return victim_index_; }
@@ -219,7 +245,11 @@ private:
 
     std::vector<std::string> filenames_;
     std::vector<FileData> files_;
-    size_t datasizelimit_;
+    std::vector<Chunk> chunks_;
+    size_t chunksize_;
+    size_t nchunks_;
+    int lp_;
+    int pb_;
     size_t max_file_size_;
 
     std::array<unsigned long long, 256> byte_freq_{};
@@ -229,42 +259,98 @@ private:
 
     /**
      * ==============================================================================
-     * Algorithm: Fair-Share Data Truncation (Water-Filling)
+     * Algorithm: Input Data Partitioning
      * ==============================================================================
-     * To accelerate the evaluation phases (SA and BFS), an optional data size limit 
-     * can be specified. This algorithm fairly distributes that total limit across 
-     * all input files. If a file is naturally smaller than its allocated fair share, 
-     * its unused quota is mathematically cascaded/redistributed to remaining files.
-     * 
-     * 1. Sort files by their actual sizes in ascending order.
-     * 2. Iteratively divide `remaining_limit` by `remaining_files` for the fair share.
-     * 3. Take `min(actual_size, fair_share)` as the current file's allocation.
-     * 4. Subtract the allocation from the remaining limit and proceed.
+     * Partitions the input files into multiple chunks adhering to the following rules:
+     * 1. Each chunk must have size chunksize or larger.
+     * 2. Each input file contributes to chunks proportional to its size.
+     * 3. Chunk data start offset in each file is a multiple of (1 << max(lp, pb))
+     *    in order not to distort alignment.
+     * 4. The portions of a file are assigned to chunks in ascending order of their offsets,
+     *    the sizes of some portions can be zero (for very small files).
      */
-    void apply_water_filling(size_t limit) {
-        if (limit == 0) {
-            for (auto& f : files_) f.fast_eval_size = f.in_buf.size();
+    void partition_data(size_t total_data_size, size_t alignment) {
+        chunks_.clear();
+        if (total_data_size == 0) {
+            Chunk c;
+            c.total_size = 0;
+            c.portions.resize(files_.size());
+            chunks_.push_back(c);
             return;
         }
-        std::vector<size_t> indices(files_.size());
-        for (size_t i = 0; i < files_.size(); i++) indices[i] = i;
-        
-        // Sort indices by file buffer size in ascending order
-        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            return files_[a].in_buf.size() < files_[b].in_buf.size();
-        });
-        
-        size_t remaining_limit = limit;
-        size_t remaining_files = files_.size();
-        
-        for (size_t idx : indices) {
-            size_t fair_share = remaining_limit / remaining_files;
-            size_t allocation = std::min(files_[idx].in_buf.size(), fair_share);
-            
-            files_[idx].fast_eval_size = allocation;
-            remaining_limit -= allocation;
-            remaining_files--;
+
+        // Determine initial maximum number of chunks K
+        size_t K = 1;
+        if (total_data_size > chunksize_) {
+            K = total_data_size / chunksize_;
+            if (K == 0) K = 1;
         }
+
+        // Iterative reduction of K if alignment rounding causes any chunk size to drop below chunksize_
+        while (true) {
+            chunks_.clear();
+            chunks_.resize(K);
+
+            for (size_t k = 0; k < K; k++) {
+                chunks_[k].portions.resize(files_.size());
+            }
+
+            for (size_t i = 0; i < files_.size(); i++) {
+                size_t S_i = files_[i].in_buf.size();
+                size_t max_aligned = (S_i / alignment) * alignment;
+
+                std::vector<size_t> offsets(K + 1, 0);
+                offsets[0] = 0;
+                offsets[K] = S_i;
+
+                for (size_t k = 1; k < K; k++) {
+                    double target = static_cast<double>(S_i) * static_cast<double>(k) / static_cast<double>(K);
+                    size_t aligned = (static_cast<size_t>(std::round(target / static_cast<double>(alignment)))) * alignment;
+
+                    if (aligned > max_aligned) aligned = max_aligned;
+                    if (aligned < offsets[k - 1]) aligned = offsets[k - 1];
+
+                    offsets[k] = aligned;
+                }
+
+                for (size_t k = 0; k < K; k++) {
+                    chunks_[k].portions[i].offset = offsets[k];
+                    chunks_[k].portions[i].size = offsets[k + 1] - offsets[k];
+                    chunks_[k].total_size += chunks_[k].portions[i].size;
+                }
+            }
+
+            bool all_valid = true;
+            for (size_t k = 0; k < K; k++) {
+                if (chunks_[k].total_size < chunksize_) {
+                    all_valid = false;
+                    break;
+                }
+            }
+
+            if (all_valid || K == 1) {
+                break;
+            }
+
+            K--;
+        }
+    }
+
+    void report_partitioning(size_t alignment) const {
+        std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
+        fprintf(stderr, "========================================================================\n");
+        fprintf(stderr, "/* INPUT DATA PARTITIONING LAYOUT */\n");
+        fprintf(stderr, "Total Number of Chunks: %zu (Target Chunk Size: %zu bytes, Alignment: %zu bytes)\n",
+                chunks_.size(), chunksize_, alignment);
+        for (size_t k = 0; k < chunks_.size(); k++) {
+            fprintf(stderr, "Chunk %zu: Total Size = %zu bytes\n", k, chunks_[k].total_size);
+            for (size_t i = 0; i < files_.size(); i++) {
+                const auto& p = chunks_[k].portions[i];
+                fprintf(stderr, "  File %zu (%s): offset %zu, size %zu bytes\n",
+                        i, files_[i].filename.c_str(), p.offset, p.size);
+            }
+        }
+        fprintf(stderr, "========================================================================\n\n");
     }
 
     static std::string get_fingerprint(const std::array<unsigned long long, 256>& freqs) {
@@ -700,7 +786,8 @@ void print_help(const char* prog_name) {
               << "  --lp=BITS              Set LZMA literal position bits (0-4, default: 0).\n"
               << "  --pb=BITS              Set LZMA position bits (0-4, default: 2).\n"
               << "  --extreme              Enable LZMA extreme compression preset during all phases.\n"
-              << "  --datasizelimit=BYTES  Set data size limit for fast eval phases (distributed among files).\n"
+              << "  --chunksize=BYTES      Set chunk size limit for partitioning (default: size of largest file).\n"
+              << "  --nchunks=INT          Set number of chunks to use during SA and BFS search (default: 1).\n"
               << "  --tablepenalty         Add a storage penalty for the remap table to the evaluation.\n"
               << "  --remapdb=FILE         Set persistent file to load/save remap database entries.\n\n";
 }
@@ -709,10 +796,12 @@ void print_help(const char* prog_name) {
  * Algorithm: LZMA Compression Wrapper
  * Utilizes lzma_lzma_preset to apply base settings, then conditionally overrides
  * specific parameters (dict, lc, lp, pb). This allows for fast low-level evaluation 
- * during search and extreme settings during final reporting.
+ * during search and extreme settings during final reporting. Incorporates preset 
+ * dictionary parsing dynamically based on chunk offsets.
  */
 size_t compress_buffer(const uint8_t* in_buf, size_t in_len, uint8_t* out_buf, size_t out_capacity, 
-                        uint32_t preset, int dict_param_kb, int lc_param, int lp_param, int pb_param) {
+                        uint32_t preset, int dict_param_kb, int lc_param, int lp_param, int pb_param,
+                        const uint8_t* preset_dict = nullptr, size_t preset_dict_size = 0) {
     lzma_options_lzma opt;
     // Initialize LZMA2 options with the provided preset (usually 0 for fast eval, 6e for extreme eval)
     if (lzma_lzma_preset(&opt, preset)) return out_capacity + 1;
@@ -723,6 +812,12 @@ size_t compress_buffer(const uint8_t* in_buf, size_t in_len, uint8_t* out_buf, s
     opt.lp = lp_param; 
     opt.pb = pb_param;
 
+    // Apply preconfigured dictionary initialization if provided
+    if (preset_dict != nullptr && preset_dict_size > 0) {
+        opt.preset_dict = preset_dict;
+        opt.preset_dict_size = (uint32_t)preset_dict_size;
+    }
+
     lzma_filter filters[2] = { { LZMA_FILTER_LZMA2, &opt }, { LZMA_VLI_UNKNOWN, nullptr } };
     size_t out_pos = 0;
     
@@ -732,27 +827,53 @@ size_t compress_buffer(const uint8_t* in_buf, size_t in_len, uint8_t* out_buf, s
 }
 
 /**
- * Algorithm: Holistic State Evaluation & Remap Penalty
+ * Algorithm: Holistic State Evaluation & Remap Penalty & Contextual Dictionary Initialization
  * Translates file buffers using the provided RemapTable and evaluates overall 
- * LZMA compression size. The 'use_fast_limit' toggle dictates whether only the 
- * fair-share allocated front-chunk (fast_eval_size) of each file is evaluated, 
- * or the entirety of the file during extreme final evaluations.
+ * LZMA compression size. The 'eval_chunks' parameter dictates how many chunks 
+ * are evaluated during fast search phases (SA and BFS) or all chunks during final evaluations.
+ * 
+ * To maximize accuracy for adjacent chunk parts in a file, it continuously initializes
+ * the LZMA dictionary with the remapped portion of the file that immediately precedes 
+ * the current evaluating chunk.
  */
-size_t evaluate_remap(const RemapTable& remap_table, const std::vector<FileData>& files, 
+size_t evaluate_remap(const RemapTable& remap_table, 
+                      const std::vector<InputFilesManager::Chunk>& chunks,
+                      const std::vector<FileData>& files, 
                       LZMAWorkspace& ws, uint32_t preset, int dict, int lc, int lp, int pb, 
-                      bool use_table_penalty, bool use_fast_limit = false) {
+                      bool use_table_penalty, size_t eval_chunks = 0) {
     size_t total = 0;
     
-    // Evaluate across all provided input files
-    for (const auto& file : files) {
-        size_t eval_size = use_fast_limit ? file.fast_eval_size : file.in_buf.size();
-        if (eval_size == 0) continue; // Safety skip if empty allocation
-        
-        // Apply permutation O(N) mapping
-        for (size_t j = 0; j < eval_size; j++) {
-            ws.remapped_buf[j] = remap_table[file.in_buf[j]];
+    size_t num_chunks = (eval_chunks == 0 || eval_chunks > chunks.size()) ? chunks.size() : eval_chunks;
+
+    for (size_t k = 0; k < num_chunks; k++) {
+        const auto& chunk = chunks[k];
+        for (size_t i = 0; i < files.size(); i++) {
+            const auto& portion = chunk.portions[i];
+            size_t eval_size = portion.size;
+            if (eval_size == 0) continue;
+
+            // Calculate preset dictionary span based on available preceding data
+            size_t dict_bytes = (size_t)dict * 1024;
+            size_t dict_len = std::min(portion.offset, dict_bytes);
+
+            // Initialize dictionary buffer space with strictly preceding remapped data
+            const uint8_t* dict_in_ptr = files[i].in_buf.data() + portion.offset - dict_len;
+            for (size_t j = 0; j < dict_len; j++) {
+                ws.remapped_buf[j] = remap_table[dict_in_ptr[j]];
+            }
+
+            // Remap target evaluation portion
+            const uint8_t* in_ptr = files[i].in_buf.data() + portion.offset;
+            for (size_t j = 0; j < eval_size; j++) {
+                ws.remapped_buf[dict_len + j] = remap_table[in_ptr[j]];
+            }
+            
+            // Evaluates utilizing the dynamically remapped preset dictionary buffer
+            total += compress_buffer(ws.remapped_buf.data() + dict_len, eval_size, 
+                                     ws.out_buf.data(), ws.out_buf.size(), 
+                                     preset, dict, lc, lp, pb, 
+                                     ws.remapped_buf.data(), dict_len);
         }
-        total += compress_buffer(ws.remapped_buf.data(), eval_size, ws.out_buf.data(), ws.out_buf.size(), preset, dict, lc, lp, pb);
     }
     
     // Optionally apply heuristic penalty to fragmented mappings
@@ -821,18 +942,19 @@ void report_improvement(const RemapTable& remap, unsigned long long iter, double
  * Evaluates all victim-index swaps, queuing states that maintain 
  * or decrease total size. Instantly aborts and resets state when a new Annealing
  * best is found. Note: Evaluations run within this thread automatically adhere to 
- * the 'datasizelimit' (use_fast_limit = true) setting for hyper-speed searching.
+ * the 'nchunks' chunk evaluation setting for hyper-speed searching.
  */
 class GreedyWorker {
 public:
     struct Task { RemapTable remap; size_t size; };
     struct BFSNode { uint64_t state; size_t size; int depth; };
 
-    GreedyWorker(const std::vector<FileData>& files, size_t max_file_size, int victim_idx,
-                 uint32_t preset, int dict, int lc, int lp, int pb, int start_bfs_depth, bool use_table_penalty)
-        : files_(files), max_file_size_(max_file_size), victim_index_(victim_idx),
+    GreedyWorker(const std::vector<InputFilesManager::Chunk>& chunks, const std::vector<FileData>& files,
+                 size_t max_file_size, int victim_idx, uint32_t preset, int dict, int lc, int lp, int pb,
+                 int start_bfs_depth, bool use_table_penalty, size_t eval_chunks)
+        : chunks_(chunks), files_(files), max_file_size_(max_file_size), victim_index_(victim_idx),
           preset_(preset), dict_(dict), lc_(lc), lp_(lp), pb_(pb), start_bfs_depth_(start_bfs_depth),
-          use_table_penalty_(use_table_penalty),
+          use_table_penalty_(use_table_penalty), eval_chunks_(eval_chunks),
           stop_flag_(false), new_task_flag_(false), has_best_(false),
           best_size_(std::numeric_limits<size_t>::max()) 
     {
@@ -1012,8 +1134,8 @@ again:;
                     RemapTable next_remap = curr_remap;
                     std::swap(next_remap[victim_index_], next_remap[i]);
 
-                    // Evaluate using the fast-limit flag set to `true`
-                    size_t next_size = evaluate_remap(next_remap, files_, ws, preset_, dict_, lc_, lp_, pb_, use_table_penalty_, true);
+                    // Evaluate using the fast evaluation chunk count flag
+                    size_t next_size = evaluate_remap(next_remap, chunks_, files_, ws, preset_, dict_, lc_, lp_, pb_, use_table_penalty_, eval_chunks_);
 
                     // Strictly Monotonic Criteria (Greedy): Only follow paths <= current state
                     if (next_size <= curr.size) {
@@ -1063,6 +1185,7 @@ again:;
         }
     }
 
+    const std::vector<InputFilesManager::Chunk>& chunks_;
     const std::vector<FileData>& files_;
     size_t max_file_size_;
     int victim_index_;
@@ -1070,6 +1193,7 @@ again:;
     int dict_, lc_, lp_, pb_;
     int start_bfs_depth_;
     bool use_table_penalty_;
+    size_t eval_chunks_;
 
     std::thread worker_thread_;
     std::mutex mtx_;
@@ -1090,7 +1214,8 @@ int main(int argc, char** argv) {
     double T_start = 50.0;
     int bfs_depth = 1;
     int dict_param_kb = 4, lc_param = 3, lp_param = 0, pb_param = 2;
-    size_t datasizelimit = 0;
+    size_t chunksize = 0;
+    size_t nchunks = 1;
     bool use_table_penalty = false;
     bool use_extreme = false;
     std::string remapdb_path = "";
@@ -1107,7 +1232,8 @@ int main(int argc, char** argv) {
         else if (arg.starts_with("--lc=")) lc_param = std::stoi(argv[i] + 5);
         else if (arg.starts_with("--lp=")) lp_param = std::stoi(argv[i] + 5);
         else if (arg.starts_with("--pb=")) pb_param = std::stoi(argv[i] + 5);
-        else if (arg.starts_with("--datasizelimit=")) datasizelimit = std::stoull(argv[i] + 16);
+        else if (arg.starts_with("--chunksize=")) chunksize = std::stoull(argv[i] + 12);
+        else if (arg.starts_with("--nchunks=")) nchunks = std::stoull(argv[i] + 10);
         else if (arg == "--tablepenalty") use_table_penalty = true;
         else if (arg == "--extreme") use_extreme = true;
         else if (arg.starts_with("--remapdb=")) remapdb_path = arg.substr(10);
@@ -1122,25 +1248,28 @@ int main(int argc, char** argv) {
 
     std::mt19937 rng(std::random_device{}());
 
-    // Centralize file loading and statistical analysis in the new manager class
-    InputFilesManager fileManager(filenames, datasizelimit);
+    // Centralize file loading, data partitioning, and statistical analysis in the manager class
+    InputFilesManager fileManager(filenames, chunksize, nchunks, lp_param, pb_param);
     if (!fileManager.loadFiles()) {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         std::cerr << "Error: Failed to load input files.\n";
         return EXIT_FAILURE;
     }
 
-    // Executes internal fast-eval water-filling, byte frequency counts, and fingerprint generation
-    fileManager.analyzeAndAdjustLimit();
+    // Executes internal fast-eval chunk partitioning, byte frequency counts, and fingerprint generation
+    fileManager.analyzeAndPartition();
 
     const auto& files = fileManager.getFiles();
+    const auto& chunks = fileManager.getChunks();
     size_t max_file_size = fileManager.getMaxFileSize();
     int victim_index = fileManager.getVictimIndex();
     std::string fingerprint = fileManager.getFingerprint();
     const auto& byte_freq = fileManager.getByteFreq();
     
-    // Limits could be auto-increased during fingerprint validation; sync state
-    datasizelimit = fileManager.getDatasizeLimit(); 
+    // Sync state for updated limits and evaluation chunk count
+    chunksize = fileManager.getChunkSize(); 
+    nchunks = fileManager.getNChunks();
+    size_t eval_chunks = std::min(nchunks, chunks.size());
 
     LZMAWorkspace main_ws(max_file_size);
 
@@ -1149,7 +1278,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "/* Top 10 Most Frequent Bytes (Concatenated Hex): %s */\n", fileManager.getTop10Hex().c_str());
         fprintf(stderr, "/* Data Fingerprint (Top 3 Hex): %s */\n", fingerprint.c_str());
         if (use_table_penalty) fprintf(stderr, "/* Table Penalty Enabled: 1 byte added per broken continuous sequence */\n");
-        if (datasizelimit > 0) fprintf(stderr, "/* Data Size Limit: Fast evaluation capped at total %zu bytes across files */\n", datasizelimit);
+        fprintf(stderr, "/* Partitioning: Total %zu chunks | Evaluating %zu chunk(s) during search */\n", chunks.size(), eval_chunks);
         if (use_extreme) fprintf(stderr, "/* Extreme Mode Enabled: Active during all phases */\n");
     }
 
@@ -1160,8 +1289,8 @@ int main(int argc, char** argv) {
     // Setup Presets Based on User Input (--extreme flag)
     uint32_t eval_preset = use_extreme ? (6 | LZMA_PRESET_EXTREME) : 6;
     
-    // Initial phase assessments run with the `use_fast_limit = true` flag
-    size_t baseline_sum = evaluate_remap(identity_remap, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
+    // Initial phase search assessments run with eval_chunks limit
+    size_t baseline_sum = evaluate_remap(identity_remap, chunks, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, eval_chunks);
     double safe_baseline = baseline_sum > 0 ? static_cast<double>(baseline_sum) : 1.0;
 
     RemapTable current_remap;
@@ -1185,7 +1314,7 @@ int main(int argc, char** argv) {
     }
     
     RemapTable initial_remap = current_remap;
-    size_t initial_sum = evaluate_remap(current_remap, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
+    size_t initial_sum = evaluate_remap(current_remap, chunks, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, eval_chunks);
     size_t current_sum = initial_sum;
     size_t sa_best_sum = initial_sum;
     RemapTable sa_best_remap = current_remap;
@@ -1200,7 +1329,7 @@ int main(int argc, char** argv) {
     }
 
     // Spin up Greedy BFS worker to operate asynchronously from the current baseline
-    GreedyWorker greedy_worker(files, max_file_size, victim_index, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, bfs_depth, use_table_penalty);
+    GreedyWorker greedy_worker(chunks, files, max_file_size, victim_index, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, bfs_depth, use_table_penalty, eval_chunks);
     greedy_worker.notify_new_annealing_best(sa_best_remap, sa_best_sum);
 
     auto start_time = std::chrono::steady_clock::now();
@@ -1264,8 +1393,8 @@ int main(int argc, char** argv) {
         RemapTable test_remap = current_remap;
         std::swap(test_remap[victim_index], test_remap[swap_idx]);
 
-        // Assess candidate mapping logic (Fast Limit: Enabled)
-        size_t test_sum = evaluate_remap(test_remap, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, true);
+        // Assess candidate mapping logic (Evaluating specified chunk subset)
+        size_t test_sum = evaluate_remap(test_remap, chunks, files, main_ws, eval_preset, dict_param_kb, lc_param, lp_param, pb_param, use_table_penalty, eval_chunks);
 
         /**
          * Algorithm: Normalized Energy Delta Calculation
@@ -1354,7 +1483,7 @@ int main(int argc, char** argv) {
      * to guarantee that whichever output is committed fundamentally provides the 
      * strongest global compression.
      * 
-     * Note: Fast Limit is FALSE. It will benchmark against complete untruncated files.
+     * Note: Evaluates all chunks across full files (eval_chunks = 0).
      */
     {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
@@ -1367,12 +1496,12 @@ int main(int argc, char** argv) {
     uint32_t final_preset = use_extreme ? (6 | LZMA_PRESET_EXTREME) : 6;
     int final_dict_kb = 8192; // 8MB
 
-    // Fetch the metrics specifically requested for the factual percentage comments
-    size_t final_baseline = evaluate_remap(identity_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
-    size_t final_baseline_default = evaluate_remap(identity_remap, files, main_ws, final_preset, final_dict_kb, 3, 0, 2, use_table_penalty, false);
+    // Fetch the metrics specifically requested for the factual percentage comments (0 evaluates all chunks)
+    size_t final_baseline = evaluate_remap(identity_remap, chunks, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, 0);
+    size_t final_baseline_default = evaluate_remap(identity_remap, chunks, files, main_ws, final_preset, final_dict_kb, 3, 0, 2, use_table_penalty, 0);
     
-    size_t final_initial_seed = evaluate_remap(initial_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
-    size_t final_sa_best = evaluate_remap(sa_best_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
+    size_t final_initial_seed = evaluate_remap(initial_remap, chunks, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, 0);
+    size_t final_sa_best = evaluate_remap(sa_best_remap, chunks, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, 0);
     
     double sa_pct_baseline = final_baseline ? ((double)((long long)final_sa_best - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
     double sa_pct_initial = final_initial_seed ? ((double)((long long)final_sa_best - (long long)final_initial_seed) / final_initial_seed) * 100.0 : 0.0;
@@ -1395,7 +1524,7 @@ int main(int argc, char** argv) {
 
     // Compare SA vs Greedy yields 
     if (has_greedy_best) {
-        size_t final_greedy_best = evaluate_remap(greedy_best_remap, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, false);
+        size_t final_greedy_best = evaluate_remap(greedy_best_remap, chunks, files, main_ws, final_preset, final_dict_kb, lc_param, lp_param, pb_param, use_table_penalty, 0);
         double greedy_pct_baseline = final_baseline ? ((double)((long long)final_greedy_best - (long long)final_baseline) / final_baseline) * 100.0 : 0.0;
         double greedy_pct_initial = final_initial_seed ? ((double)((long long)final_greedy_best - (long long)final_initial_seed) / final_initial_seed) * 100.0 : 0.0;
 
