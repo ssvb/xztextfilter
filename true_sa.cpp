@@ -310,10 +310,14 @@ class RemapDatabase {
 public:
     explicit RemapDatabase(const std::string& filepath) : filepath_(filepath) {}
 
-    // Formulate the expected array name based on LZMA parameters, extreme flag, and file fingerprint
-    static std::string get_declaration_name(int lc, int lp, int pb, bool use_extreme, const std::string& fingerprint) {
+    // Formulate the expected array name based on LZMA parameters, extreme flag, file fingerprint, and type
+    static std::string get_declaration_name(int lc, int lp, int pb, bool use_extreme, const std::string& fingerprint, bool is_decoder) {
         char target_decl[128];
-        snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc, lp, pb, use_extreme ? "e" : "", fingerprint.c_str());
+        if (is_decoder) {
+            snprintf(target_decl, sizeof(target_decl), "lzma_decoder_byte_remap_%d%d%d%s_%s", lc, lp, pb, use_extreme ? "e" : "", fingerprint.c_str());
+        } else {
+            snprintf(target_decl, sizeof(target_decl), "lzma_byte_remap_%d%d%d%s_%s", lc, lp, pb, use_extreme ? "e" : "", fingerprint.c_str());
+        }
         return std::string(target_decl);
     }
 
@@ -335,8 +339,9 @@ public:
 
     /**
      * Formats the remap table as a valid C source string buffer.
+     * Important: We format dynamically as inverted, grouping them by calculated buckets.
      */
-    static std::string format_table(const std::string& var_name, const RemapTable& remap, bool print_stats = false, double pct_a = 0.0, double pct_b = 0.0) {
+    static std::string format_table(const std::string& var_name, const RemapTable& remap, int lc, bool print_stats = false, double pct_a = 0.0, double pct_b = 0.0) {
         std::ostringstream oss;
         if (print_stats) {
             // Output factual accuracy update: the new percentage metrics
@@ -345,30 +350,54 @@ public:
             oss << stat_buf;
         }
         oss << "unsigned char " << var_name << "[256] = {\n    ";
+
+        /**
+         * Algorithm: Output Inversion
+         * Values and indexes are swapped to formulate the decoder array format 
+         * for visualization and serialization.
+         */
+        RemapTable inverted;
+        for (int i = 0; i < 256; i++) inverted[remap[i]] = i;
+
         for (int i = 0; i < 256; i++) {
-            oss << format_byte(remap[i]);
-            if (i < 255) oss << ", ";
-            if ((i + 1) % 16 == 0 && i < 255) oss << "\n    ";
+            oss << format_byte(inverted[i]);
+            
+            // Append bucket identification strictly at 16-byte boundaries
+            if ((i + 1) % 16 == 0) {
+                int bucket = i >> (8 - lc);
+                if (i < 255) oss << ",  /* bucket " << bucket << " */\n    ";
+                else oss << "   /* bucket " << bucket << " */\n";
+            } else {
+                if (i < 255) oss << ", ";
+            }
         }
-        oss << "\n};\n";
+        oss << "};\n";
         return oss.str();
     }
 
-    // Rigid Seed File Parser & Permutation Validator
+    // Rigid Seed File Parser & Permutation Validator (Supports both normal and decoder targets)
     bool load(int lc, int lp, int pb, bool use_extreme, const std::string& fingerprint, RemapTable& out_remap) const {
         if (filepath_.empty()) return false;
         FILE *file = fopen(filepath_.c_str(), "r");
         if (!file) return false; // Silently return if file does not exist
 
-        std::string target_decl = get_declaration_name(lc, lp, pb, use_extreme, fingerprint);
+        std::string target_decl_new = get_declaration_name(lc, lp, pb, use_extreme, fingerprint, true);
+        std::string target_decl_old = get_declaration_name(lc, lp, pb, use_extreme, fingerprint, false);
 
         char line[512];
-        int found_decl = 0;
+        bool found_decl = false;
+        bool is_inverted = false;
 
         // Scan for dynamic target array declaration (Ignores preceding comments)
         while (fgets(line, sizeof(line), file)) {
-            if (strstr(line, target_decl.c_str()) != NULL) {
-                found_decl = 1;
+            if (strstr(line, target_decl_new.c_str()) != NULL) {
+                found_decl = true;
+                is_inverted = true;
+                break;
+            }
+            if (strstr(line, target_decl_old.c_str()) != NULL) {
+                found_decl = true;
+                is_inverted = false;
                 break;
             }
         }
@@ -395,6 +424,8 @@ public:
             return false; // Malformed declaration
         }
 
+        RemapTable temp_remap;
+
         // Robust parsing of byte literals, supporting both hex (0x00) and char ('a', '\n') formats
         int count = 0, c;
         while (count < 256 && (c = fgetc(file)) != EOF) {
@@ -402,7 +433,7 @@ public:
                 int next = fgetc(file);
                 if (next == 'x' || next == 'X') {
                     unsigned int val;
-                    if (fscanf(file, "%2x", &val) == 1) out_remap[count++] = (unsigned char)val;
+                    if (fscanf(file, "%2x", &val) == 1) temp_remap[count++] = (unsigned char)val;
                 } else ungetc(next, file); 
             } else if (c == '\'') {
                 int char_val = fgetc(file);
@@ -411,7 +442,7 @@ public:
                     if (escaped == '\'') char_val = '\'';
                     else if (escaped == '\\') char_val = '\\';
                 }
-                out_remap[count++] = (unsigned char)char_val;
+                temp_remap[count++] = (unsigned char)char_val;
                 // Consume characters until the closing quote
                 while ((c = fgetc(file)) != EOF && c != '\'') { }
             } else if (c == '}') break; // End of array detected
@@ -433,12 +464,12 @@ public:
          */
         int seen[256] = {0};
         for (int i = 0; i < 256; i++) {
-            if (seen[out_remap[i]]) {
+            if (seen[temp_remap[i]]) {
                 std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
-                fprintf(stderr, "Error: DB file array contains duplicate value 0x%02X.\n", out_remap[i]);
+                fprintf(stderr, "Error: DB file array contains duplicate value 0x%02X.\n", temp_remap[i]);
                 return false; 
             }
-            seen[out_remap[i]] = 1;
+            seen[temp_remap[i]] = 1;
         }
 
         for (int i = 0; i < 256; i++) {
@@ -446,6 +477,22 @@ public:
                 std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
                 fprintf(stderr, "Error: DB file array is missing value 0x%02X (skips present).\n", i);
                 return false;
+            }
+        }
+
+        /**
+         * Algorithm: Decoding and Reverting
+         * If the loaded array was in the new inverted "decoder" format, we invert 
+         * it back here to strictly maintain the standard non-inverted operations 
+         * for the remainder of the application.
+         */
+        if (is_inverted) {
+            for (int i = 0; i < 256; i++) {
+                out_remap[temp_remap[i]] = i;
+            }
+        } else {
+            for (int i = 0; i < 256; i++) {
+                out_remap[i] = temp_remap[i];
             }
         }
 
@@ -486,17 +533,32 @@ public:
             ifs.close();
         }
 
-        std::string target_decl = get_declaration_name(lc, lp, pb, use_extreme, fingerprint);
+        std::string target_decl_new = get_declaration_name(lc, lp, pb, use_extreme, fingerprint, true);
+        std::string target_decl_old = get_declaration_name(lc, lp, pb, use_extreme, fingerprint, false);
 
         std::string new_content;
         char header[256];
         
         // Construct the updated factual representation of the percentage comment
-        snprintf(header, sizeof(header), "/* %+.3f%% %+.3f%% */\nunsigned char %s[256] = {\n    ", pct_a, pct_b, target_decl.c_str());
+        snprintf(header, sizeof(header), "/* %+.3f%% %+.3f%% */\nunsigned char %s[256] = {\n    ", pct_a, pct_b, target_decl_new.c_str());
         new_content += header;
+        
+        /**
+         * Algorithm: Invert Mapping for Persistence
+         * Values and indexes are swapped to formulate the decoder array format.
+         */
+        RemapTable inverted_remap;
+        for (int i = 0; i < 256; i++) inverted_remap[best_remap[i]] = i;
+
         for (int i = 0; i < 256; i++) {
-            new_content += format_byte(best_remap[i]);
-            if (i < 255) new_content += ((i + 1) % 16 == 0) ? ",\n    " : ", ";
+            new_content += format_byte(inverted_remap[i]);
+            if ((i + 1) % 16 == 0) {
+                int bucket = i >> (8 - lc);
+                if (i < 255) new_content += ",  /* bucket " + std::to_string(bucket) + " */\n    ";
+                else new_content += "   /* bucket " + std::to_string(bucket) + " */";
+            } else {
+                if (i < 255) new_content += ", ";
+            }
         }
         
         /**
@@ -507,7 +569,11 @@ public:
          */
         new_content += "\n};";
 
-        size_t decl_pos = in_str.find(target_decl);
+        // Favor seeking the newer inverted declaration, fallback to resolving the older syntax
+        size_t decl_pos = in_str.find(target_decl_new);
+        if (decl_pos == std::string::npos) {
+            decl_pos = in_str.find(target_decl_old);
+        }
         
         if (decl_pos != std::string::npos) {
             // Step backwards to find the "unsigned" keyword
@@ -614,7 +680,7 @@ public:
         // Dump final payload mapping to console for user visibility
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "/* Saved Improved Remap Table Dump: */\n%s", 
-                format_table(target_decl, best_remap, true, pct_a, pct_b).c_str());
+                format_table(target_decl_new, best_remap, lc, true, pct_a, pct_b).c_str());
     }
 
 private:
@@ -745,7 +811,7 @@ void report_improvement(const RemapTable& remap, unsigned long long iter, double
             prob_0_01, prob_0_10, prob_1_00);
 
     fprintf(stderr, "\nCurrent Remap Table Dump:\n%s", 
-            RemapDatabase::format_table("current_remap", remap).c_str());
+            RemapDatabase::format_table("current_decoder_remap", remap, lc).c_str());
     fprintf(stderr, "========================================================================\n\n");
 }
 
@@ -971,14 +1037,14 @@ again:;
                             fprintf(stderr, "Absolute Byte Saved vs Start Baseline : %lld bytes\n", (long long)start_task.size - (long long)next_size);
 
                             fprintf(stderr, "\nInitial State Worker Started From:\n%s", 
-                                    RemapDatabase::format_table("initial_state_remap", start_task.remap).c_str());
+                                    RemapDatabase::format_table("initial_state_decoder_remap", start_task.remap, lc_).c_str());
                             if (start_task.remap != current_root_task.remap) {
                                 fprintf(stderr, "\nCurrent BFS Checkpoint:\n%s", 
-                                        RemapDatabase::format_table("bfs_checkpoint_remap", current_root_task.remap).c_str());
+                                        RemapDatabase::format_table("bfs_checkpoint_decoder_remap", current_root_task.remap, lc_).c_str());
                             }
                             fprintf(stderr, "\nCurrent Greedy Best Remap Table Dump (%d steps from start):\n%s", 
                                     cumulative_depth + next_depth, 
-                                    RemapDatabase::format_table("greedy_best_remap", next_remap).c_str());
+                                    RemapDatabase::format_table("greedy_best_decoder_remap", next_remap, lc_).c_str());
                             fprintf(stderr, "========================================================================\n\n");
                         }
 
@@ -1378,10 +1444,10 @@ int main(int argc, char** argv) {
         if (!improvement_found) fprintf(stderr, "/* No meaningful improvement vs initial state found; skipping save. */\n");
         else fprintf(stderr, "/* No DB file provided; skipping save. */\n");
         
-        std::string final_target_decl = RemapDatabase::get_declaration_name(lc_param, lp_param, pb_param, use_extreme, fingerprint);
+        std::string final_target_decl = RemapDatabase::get_declaration_name(lc_param, lp_param, pb_param, use_extreme, fingerprint, true);
         
         fprintf(stderr, "\nFinal Remap Table Dump (Optimal Configuration):\n%s", 
-                RemapDatabase::format_table(final_target_decl, final_optimal_remap, true, pct_a, pct_b).c_str());
+                RemapDatabase::format_table(final_target_decl, final_optimal_remap, lc_param, true, pct_a, pct_b).c_str());
     }
 
     return EXIT_SUCCESS;
