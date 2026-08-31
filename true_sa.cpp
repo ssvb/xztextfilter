@@ -879,10 +879,18 @@ size_t evaluate_remap(const RemapTable& remap_table,
     
     // Optionally apply heuristic penalty to fragmented mappings
     if (use_table_penalty) {
+        /**
+         * Algorithm: Inverted Table Penalty Assessment
+         * Transforms the current mapping into an inverted (decoder) table to accurately
+         * evaluate sequential fragmentation. Adds 1 byte of penalty for every 
+         * non-contiguous byte sequence found in the inverted mapping.
+         */
+        RemapTable inverted;
+        for (int i = 0; i < 256; i++) inverted[remap_table[i]] = i;
+
         size_t penalty = 0;
         for (int i = 0; i < 255; i++) {
-            // Adds 1 byte of penalty for every non-contiguous byte sequence
-            if ((int)remap_table[i+1] - (int)remap_table[i] != 1) penalty++;
+            if ((int)inverted[i+1] - (int)inverted[i] != 1) penalty++;
         }
         total += penalty;
     }
@@ -1280,7 +1288,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::recursive_mutex> lock(stderr_mtx);
         fprintf(stderr, "/* Top 10 Most Frequent Bytes (Concatenated Hex): %s */\n", fileManager.getTop10Hex().c_str());
         fprintf(stderr, "/* Data Fingerprint (Top 3 Hex): %s */\n", fingerprint.c_str());
-        if (use_table_penalty) fprintf(stderr, "/* Table Penalty Enabled: 1 byte added per broken continuous sequence */\n");
+        if (use_table_penalty) fprintf(stderr, "/* Table Penalty Enabled: 1 byte added per broken continuous sequence on inverted table */\n");
         fprintf(stderr, "/* Partitioning: Total %zu chunks | Evaluating %zu chunk(s) during search */\n", chunks.size(), eval_chunks);
         if (use_extreme) fprintf(stderr, "/* Extreme Mode Enabled: Active during all phases */\n");
     }
